@@ -1,0 +1,18 @@
+{
+  "name": "webmidi-usb-uart-bridge-host",
+  "version": "0.1.0",
+  "description": "Host-side client and loopback test rig for the WebMIDI USB/UART bridge",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "loopback": "node bin/loopback.js",
+    "list": "node bin/list-ports.js"
+  },
+  "dependencies": {
+    "@julusian/midi": "^3.1.1"
+  }
+}
