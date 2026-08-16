@@ -60,6 +60,21 @@ next person does not rediscover them.
   *mode* on this backend, not lines the host can poke — hence `kCapFlowRtsCts`
   without `kCapRts`/`kCapCts`.
 
+## The host client
+
+- **Never `unref()` a timer that carries protocol traffic.** Both the credit
+  idle timer and the fake device's wire timer were originally unref'd, on the
+  reasoning that a CLI should not be held open by housekeeping. But a credit
+  window means both ends spend most of a throttled transfer waiting on the
+  other, and at that moment the only pending work in the process *is* those
+  timers — so Node saw an empty event loop and exited mid-transfer, with exit
+  code 0 and no error. `npm run loopback -- --fake` printed its header, no
+  result rows, and "passed" nothing. `destroy()`/`close()` is the right place
+  to stop the timers; the event loop is not.
+- That bug was found by the software device model, not by hardware, and only
+  at payload sizes large enough to be throttled. It is the clearest argument
+  for `host/src/fake-device.js` existing at all.
+
 ## Protocol
 
 - 7-in-8 packing has no single canonical bit order. Both "MSB byte first, bit

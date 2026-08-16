@@ -263,11 +263,12 @@ export class FakeDevice {
     // If the wire throttled us, come back for the rest.
     if (this.baudLimited && (this.toBackend.length > 0 || this.toHost.length > 0)) {
       if (!this.drainTimer) {
+        // Not unref'd: this is the simulated wire still moving bytes, and a
+        // caller awaiting them must keep the process alive. close() clears it.
         this.drainTimer = setTimeout(() => {
           this.drainTimer = null;
           this.#pump();
         }, 1);
-        this.drainTimer.unref?.();
       }
     }
   }
@@ -295,11 +296,12 @@ export class FakeDevice {
       return;
     }
     if (this.creditTimer) return;
+    // Not unref'd, for the same reason as the client's: this CREDIT is what
+    // unblocks the host's next write.
     this.creditTimer = setTimeout(() => {
       this.creditTimer = null;
       if (this.freed > 0) this.#returnCredit();
     }, CREDIT_IDLE_MS);
-    this.creditTimer.unref?.();
   }
 
   #returnCredit() {

@@ -408,13 +408,14 @@ export class BridgeClient extends Emitter {
       return;
     }
     if (this.creditTimer) return;
+    // Deliberately not unref'd. This timer carries the CREDIT that unblocks
+    // the device's next DATA frame, so it is protocol traffic, not
+    // housekeeping: letting Node exit while it is pending strands a transfer
+    // with both ends waiting on the other. destroy() is what clears it.
     this.creditTimer = setTimeout(() => {
       this.creditTimer = null;
       if (this.freed > 0) this.#returnCredit();
     }, CREDIT_IDLE_MS);
-    // Node keeps the process alive for pending timers; this one is pure
-    // housekeeping and must not hold a CLI open.
-    this.creditTimer.unref?.();
   }
 
   #returnCredit() {

@@ -266,6 +266,23 @@ test('read takes only what was asked for', async () => {
   client.destroy();
 });
 
+// Regression: the credit and wire timers used to be unref'd, so once a
+// transfer was throttled to a baud rate and both ends were waiting on a timer,
+// Node saw an empty event loop and exited mid-transfer. Silently — exit code 0,
+// no rows printed. Anything that carries protocol traffic has to hold the loop.
+test('a throttled transfer completes instead of the loop draining', async () => {
+  const device = new FakeDevice({ baudLimited: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 9600 });
+
+  const payload = Uint8Array.from({ length: 3000 }, (_, i) => i & 0xff);
+  await client.write(payload);
+  const back = await client.readExactly(payload.length, 20000);
+
+  assert.deepEqual(back, payload);
+  client.destroy();
+});
+
 test('a bulk transfer arrives intact and in order', async () => {
   const device = new FakeDevice();
   const client = new BridgeClient(device);
