@@ -6,7 +6,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BridgeClient, ProtocolError } from '../src/client.js';
-import { Cmd, Err, MAX_DATA_RAW, Parity, PortState, Rsp } from '../src/constants.js';
+import {
+  BackendId,
+  Cap,
+  Cmd,
+  Err,
+  MAX_DATA_RAW,
+  Parity,
+  PortState,
+  Rsp,
+} from '../src/constants.js';
 import { FakeDevice } from '../src/fake-device.js';
 import { ParseStatus, parseFrame } from '../src/frame.js';
 
@@ -298,5 +307,97 @@ test('a bulk transfer arrives intact and in order', async () => {
 
   assert.deepEqual(back, payload);
   assert.deepEqual(warnings, [], `unexpected warnings: ${warnings.join('; ')}`);
+  client.destroy();
+});
+
+// ---- hot-plug (PROTOCOL.md §5.8) -------------------------------------------
+
+test('a non-hotplug device always reads as attached', async () => {
+  const device = new FakeDevice();
+  const client = new BridgeClient(device);
+
+  const info = await client.hello();
+  assert.equal(info.caps & Cap.HOTPLUG, 0);
+  const status = await client.getStatus();
+  assert.equal(status.present, true);
+  assert.equal(client.attached, true);
+
+  // And waiting for an attach on such a device is a no-op, not a 30 s stall.
+  await client.waitForAttach(50);
+  client.destroy();
+});
+
+test('detach faults the port and fails the writes waiting on it', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  const detached = new Promise((resolve) => client.once('detach', resolve));
+  // No credit was granted, so this write is parked waiting for some — exactly
+  // the case that would otherwise hang for ever once the far end is gone.
+  client.credit = 0;
+  const parked = client.write(Uint8Array.from([1, 2, 3]));
+
+  device.detach();
+  const arg = await detached;
+
+  assert.equal(arg, BackendId.PIO_USB_CDC);
+  assert.equal(client.attached, false);
+  assert.equal(client.state, PortState.FAULT);
+  await assert.rejects(parked, (e) => e instanceof ProtocolError && e.code === Err.BACKEND);
+  client.destroy();
+});
+
+test('bytes received before a detach still reach the host', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  const payload = Uint8Array.from([0x00, 0x7f, 0x80, 0xff]);
+  await client.write(payload);
+  // Pulled out in the same breath, before the device has framed them up.
+  device.detach();
+
+  const back = await client.readExactly(payload.length, 2000);
+  assert.deepEqual(back, payload);
+  client.destroy();
+});
+
+test('reattaching clears the fault and the port can be reopened', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  device.detach();
+  await new Promise((resolve) => client.once('detach', resolve));
+
+  const attached = new Promise((resolve) => client.once('attach', resolve));
+  device.attach();
+  await attached;
+  assert.equal(client.attached, true);
+
+  const status = await client.open({ baud: 115200 });
+  assert.equal(status.state, PortState.OPEN);
+  assert.equal(status.present, true);
+
+  const payload = Uint8Array.from([0xde, 0xad, 0xbe, 0xef]);
+  await client.write(payload);
+  assert.deepEqual(await client.readExactly(payload.length, 2000), payload);
+  client.destroy();
+});
+
+test('waitForAttach returns once something is plugged in', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.hello();
+
+  // Nothing attached when the host arrives: no EVT_ATTACH was ever sent to it,
+  // so the answer has to come from STATUS.
+  device.present = false;
+  const waiting = client.waitForAttach(2000);
+  setTimeout(() => device.attach(), 20);
+
+  await waiting;
+  assert.equal(client.attached, true);
   client.destroy();
 });

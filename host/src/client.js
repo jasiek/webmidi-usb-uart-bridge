@@ -9,6 +9,7 @@
 // works over the Web MIDI API. See DECISIONS.md D3.
 
 import {
+  Cap,
   Cmd,
   CREDIT_IDLE_MS,
   ERR_NAMES,
@@ -56,6 +57,9 @@ export class BridgeClient extends Emitter {
     /** Device capabilities, populated by hello(). */
     this.info = null;
     this.state = PortState.CLOSED;
+    // Whether a far end is attached. True until a device says otherwise,
+    // because a backend that cannot be unplugged never will. §5.8.
+    this.attached = true;
 
     // Flow control, §6. `credit` is what we may still send; `freed` is what we
     // have consumed and not yet handed back.
@@ -135,6 +139,35 @@ export class BridgeClient extends Emitter {
   async getStatus() {
     const status = await this.#request(new FrameBuilder(Cmd.GET_STATUS).build(), Rsp.STATUS);
     return this.#readStatus(status);
+  }
+
+  /**
+   * Resolves once a far end is attached, immediately if one already is.
+   * On a backend that cannot be unplugged this is always a no-op, so it is
+   * safe to call unconditionally before open(). §5.8.
+   *
+   * @param {number} [timeoutMs] rejects after this long with nothing attached
+   */
+  async waitForAttach(timeoutMs = 30000) {
+    if (!this.info) await this.hello();
+    if ((this.info.caps & Cap.HOTPLUG) === 0) return;
+    // Ask rather than assume: the adapter may have been plugged in before we
+    // connected, in which case its EVT_ATTACH was emitted to nobody.
+    await this.getStatus();
+    if (this.attached) return;
+
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.off('attach', onAttach);
+        reject(new Error(`nothing attached to the device after ${timeoutMs} ms`));
+      }, timeoutMs);
+      const onAttach = () => {
+        clearTimeout(timer);
+        this.off('attach', onAttach);
+        resolve();
+      };
+      this.on('attach', onAttach);
+    });
   }
 
   /** Round-trips an opaque cookie; resolves with the latency in ms. */
@@ -271,8 +304,13 @@ export class BridgeClient extends Emitter {
       rxCount: cursor.u21(),
       txCount: cursor.u21(),
       credit: cursor.u14(),
+      // Added after the first release. A device that does not send it cannot
+      // have a far end that comes and goes, so "attached" is the right answer.
+      // PROTOCOL.md §5.4.
+      present: cursor.remaining > 0 ? cursor.u7() === 1 : true,
     };
     this.state = status.state;
+    this.attached = status.present;
     return status;
   }
 
@@ -371,6 +409,19 @@ export class BridgeClient extends Emitter {
         const arg = cursor.u7();
         this.emit('event', { event, arg });
         if (event === Evt.LINES) this.emit('lines', arg);
+        if (event === Evt.ATTACH) {
+          this.attached = true;
+          this.emit('attach', arg);
+        }
+        if (event === Evt.DETACH) {
+          this.attached = false;
+          this.state = PortState.FAULT;
+          // The device faults the port on detach, so nothing queued for the
+          // far end will ever be granted credit. Same reasoning as ERR_NOT_OPEN
+          // above: fail it now rather than leave a caller waiting for ever.
+          this.#failWrites(new ProtocolError(Err.BACKEND, arg));
+          this.emit('detach', arg);
+        }
         break;
       }
 

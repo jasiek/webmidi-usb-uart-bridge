@@ -6,6 +6,7 @@
 //   npm run loopback
 //   npm run loopback -- --baud 115200 --bytes 65536
 //   npm run loopback -- --fake          # no hardware; exercises the harness
+//   npm run loopback -- --fake-cdc      # same, modelling the phase 2 host port
 //
 // Every byte sent must come back, in order, at every speed. Anything else is
 // a failure with a non-zero exit code.
@@ -23,18 +24,32 @@ function parseArgs(argv) {
     bauds: DEFAULT_BAUDS,
     bytes: 4096,
     fake: false,
+    fakeHotplug: false,
     timeoutMs: 30000,
+    // Only consulted on a hot-plug backend: how long to hold the run open
+    // waiting for an adapter to be plugged into the host port.
+    attachTimeoutMs: 30000,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--fake') args.fake = true;
+    else if (arg === '--fake-cdc') {
+      // The software model wearing the phase 2 backend's identity: hot-plug
+      // capability, PIO-USB CDC backend id. Exercises the attach path in the
+      // harness itself, which is where its bugs would otherwise hide.
+      args.fake = true;
+      args.fakeHotplug = true;
+    }
     else if (arg === '--port') args.port = argv[++i];
     else if (arg === '--bytes') args.bytes = Number(argv[++i]);
     else if (arg === '--timeout') args.timeoutMs = Number(argv[++i]);
+    else if (arg === '--attach-timeout') args.attachTimeoutMs = Number(argv[++i]);
     else if (arg === '--baud') args.bauds = argv[++i].split(',').map(Number);
     else if (arg === '--help' || arg === '-h') {
       console.log(
-        'usage: loopback [--port <name>] [--baud 9600,115200] [--bytes N] [--fake]',
+        'usage: loopback [--port <name>] [--baud 9600,115200] [--bytes N]\n' +
+          '                [--fake | --fake-cdc]\n' +
+          '                [--timeout ms] [--attach-timeout ms]',
       );
       process.exit(0);
     } else {
@@ -115,8 +130,10 @@ async function main() {
 
   let transport;
   if (args.fake) {
-    console.log('running against the software device model (--fake)\n');
-    transport = new FakeDevice({ baudLimited: true });
+    console.log(
+      `running against the software device model (${args.fakeHotplug ? '--fake-cdc' : '--fake'})\n`,
+    );
+    transport = new FakeDevice({ baudLimited: true, hotplug: args.fakeHotplug });
   } else {
     transport = new NodeMidiTransport(args.port);
     console.log(`in:  ${transport.inputName}`);
@@ -133,6 +150,17 @@ async function main() {
     console.log(`firmware ${info.firmware}, protocol v${info.protocol}, ${backend}`);
     console.log(`window ${info.rxBuffer} B, frame ${info.maxRaw} B, max ${info.maxBaud} baud`);
     console.log(`capabilities: ${describeCaps(info.caps)}\n`);
+
+    if (info.caps & Cap.HOTPLUG) {
+      // On a host-port build there may be nothing downstream yet. Waiting is
+      // friendlier than a run of ERR_BACKEND, and it makes "plug it in now" a
+      // valid way to start the test.
+      if (!(await client.getStatus()).present) {
+        console.log('waiting for a serial adapter on the host port…');
+      }
+      await client.waitForAttach(args.attachTimeoutMs);
+      console.log('far end attached\n');
+    }
 
     console.log('  baud     bytes      time    throughput   ping   result');
     console.log('  ' + '-'.repeat(60));
