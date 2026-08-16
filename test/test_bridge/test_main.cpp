@@ -95,7 +95,13 @@ class MockSink : public FrameSink {
     return true;
   }
 
+  void discardQueued() override {
+    ++discards;
+    frames.clear();
+  }
+
   bool isReady = true;
+  int discards = 0;
   std::vector<CapturedFrame> frames;
 
   void clear() { frames.clear(); }
@@ -692,6 +698,43 @@ static void test_future_version_gets_one_error(void) {
   TEST_ASSERT_EQUAL_UINT8(kProtocolVersion, errorDetail(err));
 }
 
+// A host that reconnects after an unclean exit finds the device holding frames
+// addressed to the conversation that just died. On real hardware that buffer
+// filled, ready() went false permanently, and the device could no longer
+// answer anyone — it looked wedged. HELLO means "new conversation", so
+// whatever is queued is stale by definition and must go before the reply.
+static void test_hello_discards_stale_output(void) {
+  openPort();
+  for (int i = 0; i < 200; ++i) backend->incoming.push_back(0x5A);
+  tick();
+  TEST_ASSERT_TRUE(sink->count(Rsp::Data) > 0);
+
+  uint8_t buf[32];
+  FrameWriter w(buf, sizeof(buf));
+  w.begin(Cmd::Hello);
+  w.u14(kRxBufferSize);
+  w.u14(kMaxDataRaw);
+  br->onSysEx(buf, w.end(), clockMs);
+
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, sink->discards,
+                                "HELLO must clear the outbound queue");
+  // And the INFO reply is the first thing the new host sees, not a tail of
+  // DATA frames belonging to somebody else's session.
+  TEST_ASSERT_TRUE(sink->frames.size() > 0);
+  TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(Rsp::Info), sink->frames[0].cmd);
+}
+
+static void test_reset_discards_stale_output(void) {
+  openPort();
+  for (int i = 0; i < 200; ++i) backend->incoming.push_back(0x5A);
+  tick();
+
+  feedSimple(Cmd::Reset);
+  TEST_ASSERT_EQUAL_INT(1, sink->discards);
+  TEST_ASSERT_TRUE(sink->frames.size() > 0);
+  TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(Rsp::Status), sink->frames[0].cmd);
+}
+
 // ---- end to end ------------------------------------------------------------
 
 static void test_full_duplex_bulk_transfer(void) {
@@ -798,6 +841,8 @@ int main(int, char**) {
   RUN_TEST(test_unknown_command_is_reported);
   RUN_TEST(test_foreign_sysex_is_ignored_silently);
   RUN_TEST(test_future_version_gets_one_error);
+  RUN_TEST(test_hello_discards_stale_output);
+  RUN_TEST(test_reset_discards_stale_output);
   RUN_TEST(test_full_duplex_bulk_transfer);
   return UNITY_END();
 }

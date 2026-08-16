@@ -60,6 +60,80 @@ next person does not rediscover them.
   *mode* on this backend, not lines the host can poke — hence `kCapFlowRtsCts`
   without `kCapRts`/`kCapCts`.
 
+## The wedge: TinyUSB calls race with tud_task()
+
+The one that cost the most to find, so the reasoning is worth keeping.
+
+**Symptom.** Under sustained traffic the device would stop answering — MIDI
+completely mute — while remaining fully enumerated on USB, with its CDC port
+still present. Intermittent: sometimes minutes of load, sometimes seconds.
+
+**Why it looked impossible.** USB stayed up because on this port `tud_task()`
+does **not** run from `loop()` — Adafruit's rp2040 backend hangs a handler off
+`USBCTRL_IRQ` that raises a soft IRQ to run it. So enumeration, and the CDC
+interface, survive a completely dead `loop()`. "The device is still there" says
+nothing about whether the firmware is running.
+
+**Finding it.** A once-a-second status line on CDC showed `loop()` stopping
+dead — no gradual slowdown, max loop time 759 µs right up to the last line.
+That rules out anything cumulative. Since the hang takes the CPU with it, the
+only way to see where it was is a marker that survives the reset the watchdog
+causes: the RP2040's **watchdog scratch registers** (`scratch[4..7]` are free
+for application use). Writing a phase code there each step of `loop()`, and
+printing it on the next boot, named the culprit in one run: `pumpUsbMidi`, and
+sometimes `sink.service`.
+
+**Cause.** Both call `tud_midi_*` directly from `loop()`, and `tud_task()` can
+preempt them from IRQ at any point — including part-way through updating the
+very endpoint FIFOs those calls are reading and writing. Nothing in the
+Adafruit Arduino wrappers guards against it.
+
+The interlock exists, but it is the *caller's* job to use it. Adafruit's task
+runner does `mutex_try_enter(&__usb_mutex)` and skips its turn when it cannot
+get the lock — the comment says "if the mutex is already owned, then we are in
+user code which will do a tud_task itself". That only works if user code
+actually holds `__usb_mutex`. `src/usb_lock.h` does.
+
+**Fix and evidence.** Before: wedged within one or two throughput sweeps, every
+time. After: four consecutive sweeps clean, then the full loopback suite, a
+64 KB bulk transfer and another sweep with no watchdog reset at all. It also
+made things *faster* — 64 KB round trip went from 7110 ms to 5898 ms, because
+the races were corrupting work that then had to be redone.
+
+**Two lessons worth keeping.** Hold `__usb_mutex` around every `tud_*` call on
+this port. And bound work per `loop()` iteration rather than looping until a
+producer-fed queue is empty — `pumpUsbMidi` now stops after 16 reads, which was
+not the cause here (the counter showed it never reached the bound) but is the
+difference between a slow loop and one that never returns.
+
+## Measured limits
+
+From `host/bin/throughput.js` on a Pico 1 over CoreMIDI, with the loopback
+jumper fitted:
+
+| Baud   | Line rate  | host → UART | UART → host | Lost |
+| ------ | ---------- | ----------- | ----------- | ---- |
+| 57600  | 5.6 kB/s   | 6.4 kB/s    | 5.6 kB/s    | 0    |
+| 115200 | 11.3 kB/s  | 12.8 kB/s   | 11.2 kB/s   | 0    |
+| 230400 | 22.5 kB/s  | 25.5 kB/s   | 22.5 kB/s   | 0    |
+| 460800 | 45.0 kB/s  | 50.2 kB/s   | 44.6 kB/s   | 0    |
+| 921600 | 90.0 kB/s  | 53.4 kB/s   | —           | 0    |
+
+The tunnel flattens at **~53 kB/s one-way**, and ~48 kB/s in each direction
+concurrently. That is the real limit, not the UART: at 921600 the line rate is
+90 kB/s and the tunnel simply cannot carry it.
+
+`INFO.maxBaud` now reports 460800 rather than the 921600 uart0 can clock. The
+old value was a promise the bridge could not keep — a host trusts that field to
+choose a safe rate.
+
+A caveat worth stating: **a loopback cannot demonstrate overrun**, because the
+device cannot receive faster than it transmits and its transmission is
+credit-paced. Nothing was lost even at 921600 for that reason alone. A far end
+that transmits independently has no such limit, so 460800 (45 kB/s each way,
+against a ~48 kB/s ceiling) has very little margin. 230400 and below have
+plenty.
+
 ## On real hardware
 
 - **CoreMIDI caches MIDI port names by VID/PID.** Setting

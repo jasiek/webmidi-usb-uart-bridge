@@ -56,7 +56,21 @@ npm run probe                    # handshake only — no jumper needed
 npm run loopback                 # 9600 … 115200, 4 KB each way
 npm run loopback -- --baud 115200 --bytes 65536
 npm run loopback -- --fake       # no hardware; exercises the harness itself
+npm run throughput               # where the tunnel, not the UART, becomes the limit
 ```
+
+If the board ever stops answering, it recovers itself — a 4 s hardware watchdog
+reboots a hung `loop()`. To reflash without touching the board, open its CDC
+port at 1200 baud and it drops into BOOTSEL:
+
+```sh
+stty -f /dev/cu.usbmodem* 1200   # then copy .pio/build/pico/firmware.uf2 to /Volumes/RPI-RP2
+```
+
+`pio run -e pico_debug -t upload` builds the same firmware with a once-a-second
+status line on the CDC interface — loop rate, buffer levels, per-phase worst-case
+timings, and the phase that was executing before a watchdog reset. That
+instrumentation is what found the wedge described in FINDINGS.md.
 
 Every byte must come back, in order, at every speed. The rig reports
 throughput, round-trip latency and any error flags the device raised, and exits
@@ -69,25 +83,31 @@ tested in CI.
 
 ## Measured on hardware
 
-Flashed to a Pico 1 and driven from macOS over CoreMIDI:
+Flashed to a Pico 1, jumper on GPIO0↔GPIO1, driven from macOS over CoreMIDI.
+Loopback round trip — every byte out and back — at each speed:
 
-| Measurement                            | Result                          |
-| -------------------------------------- | ------------------------------- |
-| `PING`/`PONG` round trip                | 0.97 ms mean, 0.77 ms best      |
-| 64 KB host → UART at 115200 8N1         | 11.2 kB/s, **99% of line rate** |
-| Bytes delivered vs. sent                | 65536 / 65536, exact            |
-| Sequence gaps, credit errors, overruns  | none                            |
+| Baud   | 4 KB round trip | Throughput | Ping    | Lost |
+| ------ | --------------- | ---------- | ------- | ---- |
+| 9600   | 4270 ms         | 1.9 kB/s   | 1.0 ms  | 0    |
+| 19200  | 2138 ms         | 3.7 kB/s   | 0.7 ms  | 0    |
+| 38400  | 1070 ms         | 7.5 kB/s   | 0.9 ms  | 0    |
+| 57600  | 713 ms          | 11.2 kB/s  | 0.7 ms  | 0    |
+| 115200 | 358 ms          | 22.4 kB/s  | 0.8 ms  | 0    |
 
-The credit window paced a 64 KB write through a 2048-byte device buffer down to
-the UART's own drain rate without a single dropped byte — which is the whole
-reason §6 exists.
+64 KB round trip at 115200: 6.5 s, exact, no sequence gaps or overruns. All
+256 byte values verified through the tunnel. `PING` round trip is under 1 ms —
+SysEx through CoreMIDI is not the bottleneck anyone expects it to be.
 
-The UART → host direction still needs the loopback jumper to be verified.
+Per-direction ceiling, from `npm run throughput`: the tunnel sustains
+**~50 kB/s** and flattens there. That is why `INFO.maxBaud` reports 460800
+rather than the 921600 uart0 can clock — see DECISIONS.md D5, and note the
+caveat there about what a loopback can and cannot prove.
 
 ## Status
 
-- **Phase 1 — hardware UART: working, host → UART verified on hardware.** USB
-  MIDI device, SysEx tunnel, credit windowing, control lines, test rig.
+- **Phase 1 — hardware UART: working, verified on hardware in both
+  directions.** USB MIDI device, SysEx tunnel, credit windowing, control lines,
+  test rig. 9600 → 460800 baud, zero loss.
 - **Phase 2 — Pico-PIO-USB CDC/ACM host: not started.** The `Backend`
   interface and the `INFO.backend` field exist for it; `hardware/README.md`
   records the pin and clock constraints it will impose.

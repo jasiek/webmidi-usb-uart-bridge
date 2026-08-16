@@ -89,3 +89,48 @@ an error rather than as corrupted firmware uploads on whatever is downstream.
 **Note.** Credits are cumulative deltas, not absolute values, so a lost credit
 message would desynchronise the window permanently. The sequence check exists
 partly to make that failure loud.
+
+## 2026-08-16 — After hardware bring-up
+
+### D5. `INFO.maxBaud` reports the tunnel's limit, not the UART's
+
+**Question.** `UartBackend::maxBaud()` originally returned 921600, which is
+what uart0 can clock. Should it?
+
+**Decision.** No — it returns 460800, chosen from measurement.
+`host/bin/throughput.js` shows the SysEx tunnel flattening at ~53 kB/s one-way
+and ~48 kB/s in each direction at once. 460800 8N1 is 45 kB/s and fits;
+921600 needs 90 kB/s and does not.
+
+**Why.** `INFO.maxBaud` is the field a host trusts when choosing a rate. A
+device that accepts 921600 and then silently drops whatever the far end sends
+beyond its capacity is worse than one that refuses. The UART divisor supporting
+a rate is not the same claim as the bridge being able to carry it.
+
+**Caveat, recorded because it limits the evidence.** The loopback rig cannot
+demonstrate overrun: with TX jumpered to RX the device cannot receive faster
+than it transmits, and its transmission is credit-paced, so the whole path is
+self-limiting. That is why nothing was lost even at 921600. A far end that
+transmits on its own has no such constraint, so 460800 has thin margin and
+230400 is the highest rate with real headroom. Proving the top end needs an
+independent traffic source, which is a phase 2 job.
+
+### D6. Watchdog plus a software reset path
+
+**Question.** The first wedge left the device enumerated but mute, with no way
+to recover it except physically unplugging the board — the 1200-baud touch did
+nothing and picotool reported no reset interface.
+
+**Decision.** Both: an RP2040 hardware watchdog (4 s) so a hung `loop()`
+recovers itself, and our own `tud_cdc_line_coding_cb` implementing the
+1200-baud touch so the board can be put into BOOTSEL over USB.
+
+**Why.** arduino-pico implements the 1200-baud reset only in its own
+`SerialUSB`, which is compiled out under `USE_TINYUSB` (`SerialUSB.cpp` line 23),
+so the convention every other Arduino board follows was simply absent. Between
+the two, a wedge never again requires physical access — which matters for a
+device whose entire purpose is being driven from a phone.
+
+The watchdog also turned out to be the diagnostic that mattered: it is what
+made the failure *visible* as `boot=WATCHDOG` rather than as an unexplained
+silence, and its scratch registers are what survived to name the hung phase.

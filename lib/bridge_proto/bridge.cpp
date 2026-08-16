@@ -67,6 +67,12 @@ void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
 }
 
 void Bridge::handleHello(FrameReader& r) {
+  // A HELLO is a host introducing itself, which makes anything still queued
+  // for the previous host stale. Dropping it here also guarantees there is
+  // room for the INFO reply, so a client reconnecting after an unclean exit
+  // gets an answer instead of silence.
+  sink_.discardQueued();
+
   uint16_t rxBuf = 0, maxRaw = 0;
   if (r.u14(rxBuf) && r.u14(maxRaw)) {
     hostRxBuffer_ = rxBuf;
@@ -210,6 +216,7 @@ void Bridge::handlePing(FrameReader& r) {
 }
 
 void Bridge::handleReset(uint32_t nowMs) {
+  sink_.discardQueued();
   backend_.close();
   state_ = PortState::Closed;
   resetSession(nowMs);
@@ -358,17 +365,23 @@ void Bridge::poll(uint32_t nowMs) {
   nowMs_ = nowMs;
   if (state_ != PortState::Open) return;
 
+  BRIDGE_PHASE(10);
   pumpToBackend();
+  BRIDGE_PHASE(11);
   pumpFromBackend();
+  BRIDGE_PHASE(12);
   pumpLines();
 
+  BRIDGE_PHASE(13);
   if (sink_.ready() && recvWin_.shouldGrant(nowMs))
     sendCredit(recvWin_.takeGrant(nowMs));
 
   // Drain toward the host for as long as USB and the window both allow. The
   // ready() check keeps a full USB endpoint from costing us buffered bytes.
+  BRIDGE_PHASE(14);
   while (sink_.ready() && sendDataChunk()) {
   }
+  BRIDGE_PHASE(15);
 }
 
 }  // namespace bridge

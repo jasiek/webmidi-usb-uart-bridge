@@ -8,6 +8,24 @@
 #include "backend.h"
 #include "bridge_proto.h"
 
+// Trace points inside open()/close(). These calls reach into the Arduino UART
+// layer, which takes blocking mutexes and can reset the peripheral — if one of
+// them never returns, the last trace printed is the one that hung. A
+// once-a-second status line cannot show that, because the hang happens between
+// two of them.
+#ifdef BRIDGE_DEBUG
+#include <Adafruit_TinyUSB.h>
+#define BRIDGE_TRACE(msg)                                            \
+  do {                                                               \
+    if (SerialTinyUSB && SerialTinyUSB.availableForWrite() > 32) {   \
+      SerialTinyUSB.printf("[trace] %s\r\n", msg);                   \
+      SerialTinyUSB.flush();                                         \
+    }                                                                \
+  } while (0)
+#else
+#define BRIDGE_TRACE(msg) do { } while (0)
+#endif
+
 namespace bridge {
 
 // Pin assignment. GPIO0/1 are uart0's default pins on the Pico.
@@ -24,9 +42,21 @@ constexpr int kPinCts = 3;
 // 3 ms of slack — enough to lose bytes whenever a USB interrupt runs long.
 constexpr size_t kUartFifoSize = 1024;
 
-// uart0 on a 125 MHz clock divides down cleanly well past this; the limit is
-// what the far end and the MIDI transport can actually keep up with.
-constexpr uint32_t kMaxBaud = 921600;
+// Not what uart0 can clock — what the *tunnel* can carry, which is the number
+// a host actually needs when choosing a safe rate.
+//
+// Measured on a Pico 1 over CoreMIDI (host/bin/throughput.js): the SysEx tunnel
+// sustains ~53 kB/s one-way and ~48 kB/s in each direction concurrently. Line
+// rate at 460800 8N1 is 45 kB/s, which fits; 921600 needs 90 kB/s and does not,
+// so the device would silently drop whatever the far end sent beyond its
+// capacity. Advertising 921600 because the UART divisor supports it was a
+// promise the bridge could not keep.
+//
+// 460800 is the highest standard rate that fits, and it passed full-duplex
+// loopback with zero loss. Its margin is thin though — a far end that
+// transmits independently, rather than echoing what we send, has nothing
+// throttling it. 230400 and below have comfortable headroom. See FINDINGS.md.
+constexpr uint32_t kMaxBaud = 460800;
 
 class UartBackend : public Backend {
  public:

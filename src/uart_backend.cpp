@@ -39,12 +39,15 @@ uint16_t UartBackend::caps() const {
 }
 
 bool UartBackend::open(const PortConfig& cfg) {
+  BRIDGE_TRACE("open: enter");
   if (open_) close();
 
+  BRIDGE_TRACE("open: set pins");
   Serial1.setTX(kPinTx);
   Serial1.setRX(kPinRx);
   // The core's default 32-byte software FIFO is under 3 ms of slack at 115200
   // baud — enough to lose bytes any time a USB interrupt runs long.
+  BRIDGE_TRACE("open: setFIFOSize");
   Serial1.setFIFOSize(kUartFifoSize);
 
   if (cfg.flags & kOpenFlagRtsCts) {
@@ -56,19 +59,25 @@ bool UartBackend::open(const PortConfig& cfg) {
     Serial1.setCTS(UART_PIN_NOT_DEFINED);
   }
 
+  BRIDGE_TRACE("open: Serial1.begin");
   Serial1.begin(cfg.baud, configWord(cfg));
+  BRIDGE_TRACE("open: begin returned");
   if (!Serial1) return false;
 
   cfg_ = cfg;
   open_ = true;
   outLines_ = 0;
+  BRIDGE_TRACE("open: done");
   return true;
 }
 
 void UartBackend::close() {
   if (!open_) return;
+  BRIDGE_TRACE("close: clear break");
   uart_set_break(kUart, false);
+  BRIDGE_TRACE("close: Serial1.end");
   Serial1.end();
+  BRIDGE_TRACE("close: end returned");
   open_ = false;
   outLines_ = 0;
 }

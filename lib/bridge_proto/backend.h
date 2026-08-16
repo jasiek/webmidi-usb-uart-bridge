@@ -55,6 +55,12 @@ class FrameSink {
 
   // `frame` is one complete SysEx message, F0 … F7 inclusive.
   virtual bool send(const uint8_t* frame, size_t len) = 0;
+
+  // Discards anything queued but not yet transmitted. Called when a host
+  // starts a new conversation (HELLO) or demands a known state (RESET):
+  // whatever is still queued was addressed to the previous conversation and
+  // would only arrive as a confusing prefix to the reply.
+  virtual void discardQueued() {}
 };
 
 }  // namespace bridge

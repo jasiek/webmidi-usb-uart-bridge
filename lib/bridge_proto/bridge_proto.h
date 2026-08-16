@@ -9,6 +9,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Progress marker for instrumented firmware builds. The firmware stores the
+// code somewhere that survives a watchdog reset, so a hang can be located even
+// though it takes the CPU with it. Compiled out of every other build, so the
+// portable library stays free of side effects.
+#ifdef BRIDGE_TRACE_PHASE
+extern "C" void bridgePhase(unsigned code);
+#define BRIDGE_PHASE(c) bridgePhase(c)
+#else
+#define BRIDGE_PHASE(c) \
+  do {                  \
+  } while (0)
+#endif
+
 namespace bridge {
 
 // ---- framing ---------------------------------------------------------------
