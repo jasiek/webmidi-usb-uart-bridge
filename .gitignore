@@ -1,0 +1,11 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+compile_commands.json
+
+node_modules/
+npm-debug.log*
+
+*~
+.DS_Store

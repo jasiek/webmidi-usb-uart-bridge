@@ -1,0 +1,374 @@
+#include "bridge.h"
+
+namespace bridge {
+
+void Bridge::begin(uint32_t nowMs) {
+  nowMs_ = nowMs;
+  resetSession(nowMs);
+  state_ = PortState::Closed;
+}
+
+void Bridge::resetSession(uint32_t nowMs) {
+  toBackend_.clear();
+  toHost_.clear();
+  recvWin_.reset(kRxBufferSize, nowMs);
+  sendWin_.reset(0);  // nothing may be sent until the host advertises a window
+  rxSeq_ = 0;
+  txSeq_ = 0;
+  rxCount_ = 0;
+  txCount_ = 0;
+  errFlags_ = 0;
+}
+
+// ---- inbound ---------------------------------------------------------------
+
+void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
+  nowMs_ = nowMs;
+
+  FrameReader r;
+  switch (FrameReader::parse(msg, n, r)) {
+    case FrameReader::Status::Ok:
+      break;
+    case FrameReader::Status::BadVersion:
+      sendError(Err::Version, kProtocolVersion);
+      return;
+    case FrameReader::Status::TooShort:
+      sendError(Err::BadLength);
+      return;
+    default:
+      // Not SysEx, or somebody else's device on the same bus. Not our business.
+      return;
+  }
+
+  const Cmd cmd = static_cast<Cmd>(r.cmd());
+
+  // HELLO and RESET are legal at any time; everything else needs a port.
+  if (state_ != PortState::Open && cmd != Cmd::Hello && cmd != Cmd::Reset &&
+      cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus) {
+    sendError(Err::NotOpen);
+    return;
+  }
+
+  switch (cmd) {
+    case Cmd::Hello:      handleHello(r); break;
+    case Cmd::Open:       handleOpen(r, nowMs); break;
+    case Cmd::Close:      handleClose(); break;
+    case Cmd::Data:       handleData(r); break;
+    case Cmd::SetLines:   handleSetLines(r); break;
+    case Cmd::Flush:      handleFlush(r); break;
+    case Cmd::Credit:     handleCredit(r); break;
+    case Cmd::Ping:       handlePing(r); break;
+    case Cmd::GetStatus:  sendStatus(); break;
+    case Cmd::Reset:      handleReset(nowMs); break;
+    default:
+      sendError(Err::BadCmd, r.cmd());
+      break;
+  }
+}
+
+void Bridge::handleHello(FrameReader& r) {
+  uint16_t rxBuf = 0, maxRaw = 0;
+  if (r.u14(rxBuf) && r.u14(maxRaw)) {
+    hostRxBuffer_ = rxBuf;
+    // Never emit a frame larger than the protocol floor the peer must support,
+    // and never larger than our own build allows.
+    hostMaxRaw_ = maxRaw == 0 || maxRaw > kMaxDataRaw
+                      ? static_cast<uint16_t>(kMaxDataRaw)
+                      : maxRaw;
+  }
+  sendInfo();
+}
+
+void Bridge::handleOpen(FrameReader& r, uint32_t nowMs) {
+  uint32_t baud = 0;
+  uint8_t databits = 0, parity = 0, stopbits = 0, flags = 0;
+  uint16_t hostRx = 0;
+  if (!r.u32(baud) || !r.u7(databits) || !r.u7(parity) || !r.u7(stopbits) ||
+      !r.u7(flags) || !r.u14(hostRx)) {
+    sendError(Err::BadLength);
+    return;
+  }
+
+  if (baud == 0 || baud > backend_.maxBaud()) {
+    sendError(Err::BadParam, 0);
+    return;
+  }
+  if (databits < 5 || databits > 8) {
+    sendError(Err::BadParam, 1);
+    return;
+  }
+  if (parity > 2) {
+    sendError(Err::BadParam, 2);
+    return;
+  }
+  if (stopbits < 1 || stopbits > 2) {
+    sendError(Err::BadParam, 3);
+    return;
+  }
+
+  PortConfig cfg;
+  cfg.baud = baud;
+  cfg.databits = databits;
+  cfg.parity = static_cast<Parity>(parity);
+  cfg.stopbits = stopbits;
+  cfg.flags = flags;
+
+  if (!backend_.open(cfg)) {
+    state_ = PortState::Fault;
+    sendError(Err::Backend);
+    return;
+  }
+
+  cfg_ = cfg;
+  state_ = PortState::Open;
+  // Re-opening is the idempotent way back to a known state: buffers, windows
+  // and both sequence counters all restart here. PROTOCOL.md §5.1.
+  resetSession(nowMs);
+  hostRxBuffer_ = hostRx;
+  sendWin_.reset(hostRx);
+  lastInputLines_ = backend_.inputLines();
+  sendStatus();
+}
+
+void Bridge::handleClose() {
+  backend_.close();
+  state_ = PortState::Closed;
+  sendStatus();
+}
+
+void Bridge::handleData(FrameReader& r) {
+  uint8_t seq = 0;
+  if (!r.u7(seq)) {
+    sendError(Err::BadLength);
+    return;
+  }
+
+  size_t len = 0;
+  if (!r.unpackRest(scratch_, sizeof(scratch_), len)) {
+    sendError(Err::BadEncoding);
+    return;
+  }
+
+  if (seq != rxSeq_) {
+    // Report the gap, then accept the frame anyway and resynchronise — losing
+    // the payload as well as the sequence helps nobody. PROTOCOL.md §7.
+    sendError(Err::Seq, rxSeq_);
+  }
+  rxSeq_ = static_cast<uint8_t>((seq + 1) & kSeqMask);
+
+  const size_t taken = toBackend_.write(scratch_, len);
+  if (taken < len) {
+    // The peer sent past its window. Say so, with the loss quantified.
+    const size_t dropped = len - taken;
+    errFlags_ |= kErrFlagHostOverflow;
+    sendError(Err::NoCredit, static_cast<uint8_t>(dropped > 127 ? 127 : dropped));
+  }
+}
+
+void Bridge::handleSetLines(FrameReader& r) {
+  uint8_t mask = 0, values = 0;
+  if (!r.u7(mask) || !r.u7(values)) {
+    sendError(Err::BadLength);
+    return;
+  }
+  backend_.setLines(mask, values);
+}
+
+void Bridge::handleFlush(FrameReader& r) {
+  uint8_t what = 0;
+  if (!r.u7(what)) {
+    sendError(Err::BadLength);
+    return;
+  }
+  if (what & kFlushDiscardTx) toBackend_.clear();
+  if (what & kFlushDiscardRx) toHost_.clear();
+  backend_.flush(what);
+  sendStatus();
+}
+
+void Bridge::handleCredit(FrameReader& r) {
+  uint16_t delta = 0;
+  if (!r.u14(delta)) {
+    sendError(Err::BadLength);
+    return;
+  }
+  sendWin_.grant(delta);
+}
+
+void Bridge::handlePing(FrameReader& r) {
+  uint8_t cookie[8];
+  size_t len = 0;
+  if (!r.rest(cookie, sizeof(cookie), len)) {
+    sendError(Err::BadLength);
+    return;
+  }
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Pong);
+  w.bytes(cookie, len);
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+void Bridge::handleReset(uint32_t nowMs) {
+  backend_.close();
+  state_ = PortState::Closed;
+  resetSession(nowMs);
+  sendStatus();
+}
+
+// ---- outbound --------------------------------------------------------------
+
+void Bridge::sendInfo() {
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Info);
+  w.u7(kProtocolVersion);
+  w.u7(fw_.major);
+  w.u7(fw_.minor);
+  w.u7(fw_.patch);
+  w.u7(static_cast<uint8_t>(backend_.id()));
+  w.u14(backend_.caps());
+  w.u14(kMaxDataRaw);
+  w.u14(kRxBufferSize);
+  w.u32(backend_.maxBaud());
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+void Bridge::sendStatus() {
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Status);
+  w.u7(static_cast<uint8_t>(state_));
+  w.u7(backend_.outputLines());
+  w.u7(backend_.inputLines());
+  w.u7(errFlags_ | backend_.takeErrorFlags());
+  errFlags_ = 0;  // sticky flags are cleared by being read. PROTOCOL.md §5.4
+  w.u21(rxCount_);
+  w.u21(txCount_);
+  w.u14(sendWin_.credit());
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+void Bridge::sendCredit(uint16_t delta) {
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Credit);
+  w.u14(delta);
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+void Bridge::sendError(Err code, uint8_t detail) {
+  if (!sink_.ready()) return;
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Error);
+  w.u7(static_cast<uint8_t>(code));
+  w.u7(detail);
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+void Bridge::sendEvent(Evt evt, uint8_t arg) {
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Event);
+  w.u7(static_cast<uint8_t>(evt));
+  w.u7(arg);
+  const size_t n = w.end();
+  if (n) sink_.send(frameBuf_, n);
+}
+
+bool Bridge::sendDataChunk() {
+  size_t want = toHost_.size();
+  if (want > hostMaxRaw_) want = hostMaxRaw_;
+  if (want > kMaxDataRaw) want = kMaxDataRaw;
+  if (want == 0) return false;
+  if (!sendWin_.canSend(want)) {
+    want = sendWin_.credit();
+    if (want == 0) return false;
+  }
+
+  const size_t got = toHost_.peek(scratch_, want);
+  FrameWriter w(frameBuf_, sizeof(frameBuf_));
+  w.begin(Rsp::Data);
+  w.u7(txSeq_);
+  w.packed(scratch_, got);
+  const size_t n = w.end();
+  if (!n) return false;
+  if (!sink_.send(frameBuf_, n)) return false;
+
+  // Only now is the data really gone: commit the buffer, the window and the
+  // sequence number together, so a refused send costs us nothing.
+  toHost_.discard(got);
+  sendWin_.consume(got);
+  txSeq_ = static_cast<uint8_t>((txSeq_ + 1) & kSeqMask);
+  return true;
+}
+
+// ---- pumps -----------------------------------------------------------------
+
+void Bridge::pumpToBackend() {
+  while (!toBackend_.empty()) {
+    const size_t room = backend_.writable();
+    if (room == 0) break;
+    size_t want = toBackend_.size();
+    if (want > room) want = room;
+    if (want > sizeof(scratch_)) want = sizeof(scratch_);
+
+    const size_t got = toBackend_.peek(scratch_, want);
+    const size_t wrote = backend_.write(scratch_, got);
+    if (wrote == 0) break;
+    toBackend_.discard(wrote);
+    txCount_ += static_cast<uint32_t>(wrote);
+    // Space in our receive buffer is what the host's credit actually buys, so
+    // credit is returned here and nowhere else.
+    recvWin_.freed(static_cast<uint16_t>(wrote));
+    if (wrote < got) break;
+  }
+}
+
+void Bridge::pumpFromBackend() {
+  while (backend_.readable() > 0 && toHost_.space() > 0) {
+    size_t want = backend_.readable();
+    if (want > toHost_.space()) want = toHost_.space();
+    if (want > sizeof(scratch_)) want = sizeof(scratch_);
+    const size_t got = backend_.read(scratch_, want);
+    if (got == 0) break;
+    toHost_.write(scratch_, got);
+    rxCount_ += static_cast<uint32_t>(got);
+  }
+}
+
+void Bridge::pumpLines() {
+  const uint8_t lines = backend_.inputLines();
+  if (lines != lastInputLines_) {
+    lastInputLines_ = lines;
+    if (sink_.ready()) sendEvent(Evt::Lines, lines);
+  }
+
+  const uint8_t flags = backend_.takeErrorFlags();
+  if (flags) {
+    errFlags_ |= flags;
+    if (sink_.ready()) {
+      if (flags & kErrFlagBreak) sendEvent(Evt::Break, 0);
+      if (flags & kErrFlagOverrun) sendEvent(Evt::Overrun, 0);
+    }
+  }
+}
+
+void Bridge::poll(uint32_t nowMs) {
+  nowMs_ = nowMs;
+  if (state_ != PortState::Open) return;
+
+  pumpToBackend();
+  pumpFromBackend();
+  pumpLines();
+
+  if (sink_.ready() && recvWin_.shouldGrant(nowMs))
+    sendCredit(recvWin_.takeGrant(nowMs));
+
+  // Drain toward the host for as long as USB and the window both allow. The
+  // ready() check keeps a full USB endpoint from costing us buffered bytes.
+  while (sink_.ready() && sendDataChunk()) {
+  }
+}
+
+}  // namespace bridge
