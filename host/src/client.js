@@ -418,6 +418,12 @@ export class BridgeClient extends Emitter {
         if (event === Evt.LINES) this.emit('lines', arg);
         if (event === Evt.ATTACH) {
           this.attached = true;
+          // The device clears its own fault when a far end reappears (§5.8),
+          // so a client left at FAULT disagrees with a device already back at
+          // CLOSED — and goes on refusing writes on the strength of a fault
+          // that is over. Closed, not open: attaching means there is a port to
+          // open, not that one has been opened.
+          if (this.state === PortState.FAULT) this.state = PortState.CLOSED;
           this.emit('attach', arg);
         }
         if (event === Evt.DETACH) {

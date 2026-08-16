@@ -386,6 +386,30 @@ test('reattaching clears the fault and the port can be reopened', async () => {
   client.destroy();
 });
 
+test('re-attaching clears the fault the detach left on the client', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+  client.on('error', () => {}); // the detach fails a write; not what is under test
+
+  device.detach();
+  await new Promise((resolve) => client.once('detach', resolve));
+  assert.equal(client.state, PortState.FAULT);
+
+  const attached = new Promise((resolve) => client.once('attach', resolve));
+  device.attach();
+  await attached;
+
+  // The device cleared its own fault on the attach (§5.8); a client still
+  // reading FAULT would refuse writes over a fault that is finished, and
+  // disagree with the very device it is talking to.
+  assert.equal(client.state, PortState.CLOSED, 'client kept a stale fault');
+  const status = await client.getStatus();
+  assert.equal(status.state, PortState.CLOSED);
+  assert.equal(client.state, PortState.CLOSED);
+  client.destroy();
+});
+
 // PROTOCOL.md §5.9: a device goes on delivering what it received before the
 // port closed, so a DATA frame from the old session can still be on the wire
 // when OPEN is sent. SysEx is ordered, so everything ahead of the STATUS reply
