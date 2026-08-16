@@ -26,6 +26,40 @@ next person does not rediscover them.
   Arduino headers is what makes host-side testing possible at all, so this is
   a setting worth having rather than a workaround.
 
+## TinyUSB on the RP2040
+
+- `CFG_TUD_MIDI_TX_BUFSIZE` is `#define`d **unconditionally** at 64 in
+  `Adafruit_TinyUSB_Arduino/src/arduino/ports/rp2040/tusb_config_rp2040.h`, so
+  no build flag can raise it. Our largest frame is 154 bytes, which means a
+  frame can never be handed to `tud_midi_stream_write()` in one call. Anything
+  that treats a short write as success will emit truncated SysEx. `UsbMidiSink`
+  keeps its own 4 KB outbound buffer for exactly this reason.
+- The device cannot be MIDI-only: `-DCFG_TUD_CDC=0` fails to compile, because
+  `Adafruit_TinyUSB_API.cpp` calls `tud_cdc_n_write_flush()` without guarding
+  on `CFG_TUD_CDC`. The bridge therefore enumerates as composite MIDI + CDC.
+  No real loss — the CDC interface is a free debug console — but it is not a
+  choice, it is a constraint.
+- `tud_task()` does not need pumping from `loop()`: the rp2040 port hangs a
+  shared handler off `USBCTRL_IRQ` that raises a soft IRQ to run it.
+
+## The Arduino UART layer (arduino-pico)
+
+- `SerialUART::write()` calls `uart_putc_raw()`, which **spins** until the
+  hardware FIFO has room, and `availableForWrite()` returns only 0 or 1 — not
+  a byte count. Both are unusable for a non-blocking bridge: blocking in the
+  TX path stalls the USB service loop and costs MIDI packets. `UartBackend`
+  writes to `uart_get_hw(uart0)->dr` directly instead, guarded by
+  `uart_is_writable()`. The RX side's software FIFO is fine and is used as-is.
+- The core's UART ISR **silently discards** characters with framing or parity
+  errors (`SerialUART.cpp`, `if (raw & 0x300) continue;`) and records nothing,
+  so those two conditions cannot be reported to the host through this core.
+  Break and software-FIFO overflow *are* available, via `getBreakReceived()`
+  and `overflow()`. `INFO.caps` reflects what is genuinely there.
+- `setRTS()`/`setCTS()` do not give you settable modem lines: `begin()` passes
+  them to `uart_set_hw_flow()`, so the UART drives RTS itself. RTS/CTS are a
+  *mode* on this backend, not lines the host can poke — hence `kCapFlowRtsCts`
+  without `kCapRts`/`kCapCts`.
+
 ## Protocol
 
 - 7-in-8 packing has no single canonical bit order. Both "MSB byte first, bit

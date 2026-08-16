@@ -5,8 +5,11 @@
 
 #include <string.h>
 
+#include <vector>
+
 #include "frame.h"
 #include "sysex7.h"
+#include "sysex_assembler.h"
 
 using namespace bridge;
 
@@ -240,6 +243,86 @@ static void test_reader_underrun_is_not_a_read(void) {
   TEST_ASSERT_EQUAL_size_t(1, r.remaining());  // and nothing was consumed
 }
 
+// ---- SysEx assembly --------------------------------------------------------
+
+using Messages = std::vector<std::vector<uint8_t>>;
+
+// Feeds a byte stream one byte at a time — the pathological case, since the
+// USB MIDI stack hands us arbitrary fragments.
+static Messages assemble(const std::vector<uint8_t>& stream, bool* overflow = nullptr) {
+  SysExAssembler<64> asm_;
+  Messages out;
+  for (uint8_t b : stream)
+    asm_.feed(&b, 1, [&](const uint8_t* p, size_t n) {
+      out.emplace_back(p, p + n);
+    });
+  if (overflow) *overflow = asm_.takeOverflow();
+  return out;
+}
+
+static void test_assembler_extracts_one_message(void) {
+  const Messages m = assemble({0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7});
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+  TEST_ASSERT_EQUAL_size_t(6, m[0].size());
+  TEST_ASSERT_EQUAL_HEX8(0xF0, m[0].front());
+  TEST_ASSERT_EQUAL_HEX8(0xF7, m[0].back());
+}
+
+static void test_assembler_ignores_bytes_between_messages(void) {
+  const Messages m = assemble({0x90, 0x40, 0x7F,            // a note on
+                               0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7,
+                               0xB0, 0x07, 0x64});          // a CC
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+}
+
+// The case that only shows up when something upstream sends MIDI clock:
+// System Real-Time bytes are legal *inside* a SysEx message and must not
+// become payload.
+static void test_assembler_passes_realtime_through_a_message(void) {
+  const Messages m = assemble({0xF0, 0x7D, 0xF8, 0x55, 0x01, 0xFE, 0x09, 0xF7});
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+  const std::vector<uint8_t> expect = {0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7};
+  TEST_ASSERT_EQUAL_size_t(expect.size(), m[0].size());
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expect.data(), m[0].data(), expect.size());
+}
+
+static void test_assembler_abandons_on_a_status_byte(void) {
+  const Messages m = assemble({0xF0, 0x7D, 0x55,   // truncated by…
+                               0x90, 0x40, 0x7F,   // …a note on
+                               0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7});
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+  TEST_ASSERT_EQUAL_size_t(6, m[0].size());
+}
+
+static void test_assembler_restarts_on_a_second_f0(void) {
+  const Messages m = assemble({0xF0, 0x11, 0x22,
+                               0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7});
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+  TEST_ASSERT_EQUAL_HEX8(0x7D, m[0][1]);
+}
+
+static void test_assembler_drops_oversized_messages(void) {
+  std::vector<uint8_t> stream = {0xF0};
+  for (int i = 0; i < 200; ++i) stream.push_back(0x01);  // far past the 64 cap
+  stream.push_back(0xF7);
+  // …followed by a good one, which must still come through.
+  for (uint8_t b : {0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7}) stream.push_back(b);
+
+  bool overflow = false;
+  const Messages m = assemble(stream, &overflow);
+  TEST_ASSERT_TRUE(overflow);
+  TEST_ASSERT_EQUAL_size_t(1, m.size());
+  TEST_ASSERT_EQUAL_size_t(6, m[0].size());
+}
+
+static void test_assembler_handles_back_to_back_messages(void) {
+  const Messages m = assemble({0xF0, 0x7D, 0x55, 0x01, 0x09, 0xF7,
+                               0xF0, 0x7D, 0x55, 0x01, 0x03, 0xF7});
+  TEST_ASSERT_EQUAL_size_t(2, m.size());
+  TEST_ASSERT_EQUAL_HEX8(0x09, m[0][4]);
+  TEST_ASSERT_EQUAL_HEX8(0x03, m[1][4]);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_packed_len_matches_pack);
@@ -261,5 +344,12 @@ int main(int, char**) {
   RUN_TEST(test_reader_flags_bad_version);
   RUN_TEST(test_reader_rejects_non_sysex);
   RUN_TEST(test_reader_underrun_is_not_a_read);
+  RUN_TEST(test_assembler_extracts_one_message);
+  RUN_TEST(test_assembler_ignores_bytes_between_messages);
+  RUN_TEST(test_assembler_passes_realtime_through_a_message);
+  RUN_TEST(test_assembler_abandons_on_a_status_byte);
+  RUN_TEST(test_assembler_restarts_on_a_second_f0);
+  RUN_TEST(test_assembler_drops_oversized_messages);
+  RUN_TEST(test_assembler_handles_back_to_back_messages);
   return UNITY_END();
 }
