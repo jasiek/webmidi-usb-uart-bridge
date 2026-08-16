@@ -7,6 +7,7 @@
 #include <unity.h>
 
 #include <deque>
+#include <utility>
 #include <vector>
 
 #include "bridge.h"
@@ -30,6 +31,9 @@ class MockBackend : public Backend {
   void close() override { isOpen_ = false; }
   bool isOpen() const override { return isOpen_; }
   bool present() const override { return presentFlag; }
+  uint32_t presence() const override {
+    return (presenceChanges << 1) | (presentFlag ? 1u : 0u);
+  }
 
   size_t writable() const override {
     const size_t pending = txCapacity > sent.size() ? txCapacity - sent.size() : 0;
@@ -67,6 +71,10 @@ class MockBackend : public Backend {
   // Test knobs.
   bool openSucceeds = true;
   bool presentFlag = true;  // a far end that can be unplugged, as in phase 2
+  // How many times presentFlag has flipped, as the real backend counts it.
+  // Bumping it by two without touching presentFlag is an unplug and replug
+  // that both happened between two polls — invisible to the level alone.
+  uint32_t presenceChanges = 0;
   size_t txCapacity = 100000;  // effectively unlimited unless a test narrows it
   std::vector<uint8_t> sent;       // bytes the bridge pushed to the far end
   std::deque<uint8_t> incoming;    // bytes the far end will deliver
@@ -950,6 +958,124 @@ static void test_status_reports_whether_a_far_end_is_attached(void) {
   TEST_ASSERT_EQUAL_UINT8(0, statusPresent(sink->last(Rsp::Status)));
 }
 
+// Every EVENT the device emitted, in order, as (event, arg) pairs. sawEvent()
+// above answers "did it happen"; these tests are about what happened first.
+static std::vector<std::pair<uint8_t, uint8_t>> eventsInOrder() {
+  std::vector<std::pair<uint8_t, uint8_t>> out;
+  for (const auto& f : sink->frames) {
+    if (f.cmd != static_cast<uint8_t>(Rsp::Event)) continue;
+    FrameReader r;
+    if (FrameReader::parse(f.bytes.data(), f.bytes.size(), r) !=
+        FrameReader::Status::Ok)
+      continue;
+    uint8_t code = 0, arg = 0;
+    if (!r.u7(code) || !r.u7(arg)) continue;
+    out.emplace_back(code, arg);
+  }
+  return out;
+}
+
+// Moves the far end the way the real backend publishes it: level and change
+// count together, so the engine sees an edge rather than inferring one.
+static void setPresent(bool present) {
+  if (backend->presentFlag == present) return;
+  backend->presentFlag = present;
+  ++backend->presenceChanges;
+}
+
+// The announcement is deferred when the endpoint is busy; a second transition
+// arriving in that window must not overwrite the first. Detach-then-attach
+// collapsing to a bare ATTACH would tell the host its port is fine when in
+// fact it faulted and needs reopening.
+static void test_a_deferred_detach_survives_a_later_attach(void) {
+  openPort();
+  tick();
+  sink->clear();
+
+  sink->isReady = false;
+  setPresent(false);
+  tick();
+  setPresent(true);
+  tick();
+  TEST_ASSERT_EQUAL_INT(0, sink->count(Rsp::Event));
+
+  sink->isReady = true;
+  tick();
+
+  const auto evts = eventsInOrder();
+  TEST_ASSERT_EQUAL_size_t(2, evts.size());
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Detach), evts[0].first);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Attach), evts[1].first);
+  // The fault the detach caused is real whether or not it could be announced.
+  TEST_ASSERT_FALSE(backend->isOpen());
+}
+
+// The level reads the same on both sides of the gap, so only the change count
+// can say that the adapter now plugged in is not the one the port was opened
+// on — and TinyUSB has already reset it to 115200 8N1 behind our back.
+static void test_a_detach_and_reattach_between_polls_still_faults_the_port(void) {
+  openPort();
+  tick();
+  sink->clear();
+  TEST_ASSERT_TRUE(backend->isOpen());
+
+  backend->presenceChanges += 2;  // out and back in, with nobody looking
+  tick();
+
+  TEST_ASSERT_FALSE_MESSAGE(backend->isOpen(),
+                            "the port stayed open across a replug");
+  TEST_ASSERT_NOT_EQUAL(static_cast<int>(PortState::Open),
+                        static_cast<int>(br->state()));
+
+  const auto evts = eventsInOrder();
+  TEST_ASSERT_EQUAL_size_t(2, evts.size());
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Detach), evts[0].first);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Attach), evts[1].first);
+
+  // And it is a fresh port: the host has to ask for it again, as after any
+  // detach. PROTOCOL.md §5.8.
+  const uint8_t payload[] = {0xAA};
+  sink->clear();
+  feedData(0, payload, sizeof(payload));
+  const CapturedFrame* err = sink->first(Rsp::Error);
+  TEST_ASSERT_NOT_NULL(err);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Err::NotOpen), errorCode(err));
+}
+
+// Three transitions with the endpoint busy throughout. The queue holds two, so
+// the oldest goes — which still leaves the host with a detach it must react to
+// and a final state that matches reality.
+static void test_a_flapping_connector_leaves_the_newest_two_events(void) {
+  openPort();
+  tick();
+  sink->clear();
+
+  sink->isReady = false;
+  setPresent(false);
+  tick();
+  setPresent(true);
+  tick();
+  setPresent(false);
+  tick();
+
+  sink->isReady = true;
+  tick();
+
+  const auto evts = eventsInOrder();
+  TEST_ASSERT_EQUAL_size_t(2, evts.size());
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Attach), evts[0].first);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Detach), evts[1].first);
+
+  // Closed rather than Fault, and that is the right answer: the port faulted
+  // on the first detach, the attach cleared it, and the second detach found
+  // nothing open to take away. Fault is what happened to a port the host
+  // asked for — DECISIONS.md D8.
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Closed),
+                        static_cast<int>(br->state()));
+  feedSimple(Cmd::GetStatus);
+  TEST_ASSERT_EQUAL_UINT8(0, statusPresent(sink->last(Rsp::Status)));
+}
+
 static void test_bytes_received_before_a_detach_still_reach_the_host(void) {
   openPort();
   const uint8_t fromFar[] = {0x01, 0x7F, 0x80, 0xFF};
@@ -1002,6 +1128,9 @@ int main(int, char**) {
   RUN_TEST(test_reattach_clears_the_fault_and_reopens);
   RUN_TEST(test_presence_event_waits_for_a_free_endpoint);
   RUN_TEST(test_status_reports_whether_a_far_end_is_attached);
+  RUN_TEST(test_a_deferred_detach_survives_a_later_attach);
+  RUN_TEST(test_a_detach_and_reattach_between_polls_still_faults_the_port);
+  RUN_TEST(test_a_flapping_connector_leaves_the_newest_two_events);
   RUN_TEST(test_bytes_received_before_a_detach_still_reach_the_host);
   return UNITY_END();
 }

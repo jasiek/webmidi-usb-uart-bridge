@@ -210,7 +210,7 @@ void CdcHostBackend::executeOp() {
 
   bool ok = false;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
-  const bool mounted = mounted_.load(std::memory_order_relaxed);
+  const bool mounted = present();
 
   switch (op) {
     case Op::Open:
@@ -296,7 +296,7 @@ bool CdcHostBackend::applyControlLines() {
 }
 
 void CdcHostBackend::pumpDevice() {
-  if (!mounted_.load(std::memory_order_relaxed)) return;
+  if (!present()) return;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
   uint8_t buf[kChunk];
 
@@ -342,6 +342,17 @@ void CdcHostBackend::serviceHost() {
   if (open_.load(std::memory_order_acquire)) pumpDevice();
 }
 
+void CdcHostBackend::setPresent(bool present) {
+  const uint32_t was = presence_.load(std::memory_order_relaxed);
+  if (((was & 1u) != 0) == present) return;  // not a transition
+  // One store, so core0 cannot read a level and a change count that disagree.
+  // The count is what lets the engine notice an unplug and replug that both
+  // land between two of its polls; the level alone reads identically before
+  // and after, and the port would be left open against a different device.
+  presence_.store((was & ~1u) + 2u + (present ? 1u : 0u),
+                  std::memory_order_release);
+}
+
 void CdcHostBackend::onMount(uint8_t idx) {
   cdcIdx_.store(idx, std::memory_order_relaxed);
   // TinyUSB's host CDC driver asserts DTR and RTS during enumeration
@@ -356,12 +367,12 @@ void CdcHostBackend::onMount(uint8_t idx) {
   if (tuh_cdc_get_rts(idx)) seeded |= kLineRts;
   outLines_.store(seeded, std::memory_order_relaxed);
 
-  mounted_.store(true, std::memory_order_release);
+  setPresent(true);
 }
 
 void CdcHostBackend::onUnmount(uint8_t idx) {
   if (idx != cdcIdx_.load(std::memory_order_relaxed)) return;
-  mounted_.store(false, std::memory_order_release);
+  setPresent(false);
   // Deliberately not dropping toDevice_ here, even though this core could do
   // it safely. The engine calls close() on seeing the detach and Op::Close is
   // where that belongs, so there is one place that decides an unplugged device

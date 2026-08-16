@@ -7,9 +7,13 @@ void Bridge::begin(uint32_t nowMs) {
   resetSession(nowMs);
   state_ = PortState::Closed;
   // Sampled rather than assumed, so a device already attached at boot is not
-  // announced as an attach to a host that was not there to miss it.
-  lastPresent_ = backend_.present();
-  presenceEvt_ = 0;
+  // announced as an attach to a host that was not there to miss it. The change
+  // count is sampled with it for the same reason: whatever happened before we
+  // were running is not news.
+  const uint32_t presence = backend_.presence();
+  lastPresent_ = (presence & 1u) != 0;
+  lastPresenceChanges_ = presence >> 1;
+  presenceQueued_ = 0;
 }
 
 void Bridge::resetSession(uint32_t nowMs) {
@@ -371,40 +375,80 @@ void Bridge::pumpLines() {
   }
 }
 
-// Attach and detach are the one thing a host cannot discover by asking: until
-// something is attached there is nothing to open, and GET_STATUS on a closed
-// port looks the same either way. So the transition is tracked as level rather
-// than edge — if the USB endpoint is busy at the moment it happens, the
-// announcement waits for a free one instead of being dropped.
-void Bridge::pumpPresence() {
-  const bool present = backend_.present();
-  if (present != lastPresent_) {
-    lastPresent_ = present;
-    if (present) {
-      // A previous detach left us in Fault. The far end is new, so the fault
-      // is over — but the port is not open until the host says so.
-      if (state_ == PortState::Fault) state_ = PortState::Closed;
-      presenceEvt_ = static_cast<uint8_t>(Evt::Attach);
-    } else {
-      if (state_ == PortState::Open) {
-        // Last chance to collect what the far end already sent. Once close()
-        // has run, a backend is entitled to forget it.
-        pumpFromBackend();
-        backend_.close();
-        state_ = PortState::Fault;
-        // Bytes still queued for a port that no longer exists are not going to
-        // arrive; holding them would deliver them to whatever is plugged in
-        // next. What came *from* the device is still ours to deliver, so
-        // toHost_ is left alone.
-        toBackend_.clear();
-      }
-      presenceEvt_ = static_cast<uint8_t>(Evt::Detach);
-    }
+// Announcing a presence change is deferred when the USB endpoint is busy, so
+// the events queue rather than overwrite one another. The state change they
+// describe is never deferred: the port faults the moment the far end goes,
+// whether or not anyone can be told yet.
+void Bridge::queuePresence(Evt evt) {
+  if (presenceQueued_ < 2) {
+    presenceQueue_[presenceQueued_++] = evt;
+    return;
+  }
+  // Full. Drop the oldest, not the newest: the newest two still alternate and
+  // still end where the far end actually is, so the host is left with an
+  // accurate picture rather than a stale one.
+  presenceQueue_[0] = presenceQueue_[1];
+  presenceQueue_[1] = evt;
+}
+
+void Bridge::applyPresence(bool present) {
+  if (present) {
+    // A previous detach left us in Fault. The far end is new, so the fault
+    // is over — but the port is not open until the host says so.
+    if (state_ == PortState::Fault) state_ = PortState::Closed;
+    queuePresence(Evt::Attach);
+    return;
   }
 
-  if (presenceEvt_ != 0 && sink_.ready()) {
-    sendEvent(static_cast<Evt>(presenceEvt_), static_cast<uint8_t>(backend_.id()));
-    presenceEvt_ = 0;
+  if (state_ == PortState::Open) {
+    // Last chance to collect what the far end already sent. Once close()
+    // has run, a backend is entitled to forget it.
+    pumpFromBackend();
+    backend_.close();
+    state_ = PortState::Fault;
+    // Bytes still queued for a port that no longer exists are not going to
+    // arrive; holding them would deliver them to whatever is plugged in
+    // next. What came *from* the device is still ours to deliver, so
+    // toHost_ is left alone.
+    toBackend_.clear();
+  }
+  queuePresence(Evt::Detach);
+}
+
+// Attach and detach are the one thing a host cannot discover by asking: until
+// something is attached there is nothing to open, and GET_STATUS on a closed
+// port looks the same either way. So they are watched as edges, counted by the
+// backend — a level would miss a detach and re-attach that both happen between
+// two polls, and leave the port Open against an adapter TinyUSB has since
+// reset to its own defaults. See Backend::presence().
+void Bridge::pumpPresence() {
+  const uint32_t presence = backend_.presence();
+  const bool present = (presence & 1u) != 0;
+  const uint32_t changes = presence >> 1;
+
+  uint32_t delta = changes - lastPresenceChanges_;
+  // A backend that cannot be unplugged leaves the count at zero for ever, and
+  // so does any Backend that has not overridden presence(). For those the
+  // level is the only evidence there is, and a change in it is one edge.
+  if (delta == 0 && present != lastPresent_) delta = 1;
+
+  if (delta != 0) {
+    lastPresenceChanges_ = changes;
+    // The run began by flipping away from what we last saw and ended at
+    // `present`; only those two ends are announced. A host acts on "my port
+    // faulted" and "there is one to open now", not on a count of how many
+    // times a connector bounced — and the first of the two is what carries the
+    // fault, so nothing that matters is collapsed away.
+    applyPresence(!lastPresent_);
+    if (delta >= 2 && present == lastPresent_) applyPresence(present);
+    lastPresent_ = present;
+  }
+
+  while (presenceQueued_ > 0 && sink_.ready()) {
+    const Evt evt = presenceQueue_[0];
+    presenceQueue_[0] = presenceQueue_[1];
+    --presenceQueued_;
+    sendEvent(evt, static_cast<uint8_t>(backend_.id()));
   }
 }
 

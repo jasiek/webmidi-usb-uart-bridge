@@ -255,6 +255,17 @@ Attaching does **not** open a port. It means there is one to open: the host
 must send `OPEN` as it would have on connecting, which is also what re-arms
 the port after the fault a detach leaves behind.
 
+A far end that is removed and replaced faster than the device notices — both
+transitions falling between two of its polls — is still reported as
+`EVT_DETACH` followed by `EVT_ATTACH`, and still faults the port. The device
+that is there afterwards is not the one the port was opened on, however
+briefly it was gone, and the host has to `OPEN` again to know what it is
+talking to. A device that flaps repeatedly while the host is not reading may
+have the middle of the sequence collapsed; what a host is guaranteed is that
+the last event it receives matches the current answer in `STATUS.present`, and
+that a detach it needs to act on is never silently swallowed by a later
+attach.
+
 A device that does not set bit 8 never emits either event and always reports
 `present` = 1.
 

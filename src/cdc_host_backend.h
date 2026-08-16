@@ -73,8 +73,9 @@ class CdcHostBackend : public Backend {
   bool open(const PortConfig& cfg) override;
   void close() override;
   bool isOpen() const override { return open_.load(std::memory_order_acquire); }
-  bool present() const override {
-    return mounted_.load(std::memory_order_acquire);
+  bool present() const override { return (presence() & 1u) != 0; }
+  uint32_t presence() const override {
+    return presence_.load(std::memory_order_acquire);
   }
 
   size_t writable() const override;
@@ -143,9 +144,16 @@ class CdcHostBackend : public Backend {
   bool applyControlLines();    // core1
   void pumpDevice();           // core1: move bytes both ways
 
+  // core1: publish an attach or a detach as one store. Bit 0 is the level and
+  // the bits above it count the flips, so core0 can never read a level from
+  // one transition and a count from another.
+  void setPresent(bool present);
+
   // --- shared state, written by exactly one core each ---
 
-  std::atomic<bool> mounted_{false};   // core1 writes
+  // Bit 0 attached, bits 1.. transitions. Boots at 0: nothing attached, and
+  // nothing has happened yet. core1 writes.
+  std::atomic<uint32_t> presence_{0};
   std::atomic<uint8_t> cdcIdx_{0};     // core1 writes
   std::atomic<bool> open_{false};      // core0 writes
   std::atomic<uint8_t> outLines_{0};   // core0 writes, core1 applies
