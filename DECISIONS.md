@@ -134,3 +134,100 @@ device whose entire purpose is being driven from a phone.
 The watchdog also turned out to be the diagnostic that mattered: it is what
 made the failure *visible* as `boot=WATCHDOG` rather than as an unexplained
 silence, and its scratch registers are what survived to name the hung phase.
+
+## 2026-08-16 — Phase 2: the CDC/ACM host backend
+
+### D7. The USB host stack gets core1, and talks to core0 through rings
+
+**Question.** Pico-PIO-USB and the protocol engine both need servicing
+promptly. Where does `tuh_task()` run?
+
+**Decision.** Core1, exclusively. Core0 keeps the MIDI device stack, the
+protocol engine and the watchdog. Between them:
+
+- two lock-free single-producer/single-consumer rings (`src/spsc_ring.h`) for
+  bulk data, one per direction;
+- a single-slot mailbox for control operations — open, close, set lines,
+  flush — which core0 posts and then *waits on*, with a one-second timeout.
+
+**Why.** Pico-PIO-USB reconstructs a full-speed bus in software; its interrupt
+has to be serviced inside a bit time, and the RP2040's own USB device
+interrupt — the MIDI side, which is the entire product — will not yield to it.
+Sharing a core means one of the two is always the loser.
+
+Making the *control* path synchronous is the part that looks wrong and is not.
+These operations happen a handful of times per session, never on the hot path,
+and blocking core0 for their duration is what makes them safe: while core0 is
+waiting it is provably not touching the rings, which is the only window in
+which core1 can clear them for a `FLUSH` or an `OPEN` without a race. The
+alternative — asynchronous ops plus locks around the rings — costs more on the
+path that actually matters, to avoid a cost on the path that does not.
+
+The timeout is not defensive programming. TinyUSB's blocking control transfer
+has no timeout of its own (FINDINGS.md), so an adapter that stops answering
+hangs core1 permanently. Core0 giving up after a second means the board keeps
+feeding its watchdog and keeps answering MIDI — so the failure surfaces as
+`ERR_BACKEND` on the host's screen rather than as a device that went quiet.
+
+**Note.** `lib/bridge_proto/ringbuf.h` says in its header comment that a core1
+backend would need release/acquire ordering on its indices. It was right; that
+is `SpscRing`, and the single-core `RingBuf` is left alone.
+
+### D8. A detach faults the port; it does not quietly close it
+
+**Question.** The adapter is unplugged mid-session. What should the host see?
+
+**Decision.** `EVT_DETACH`, the port moves to `fault`, anything still queued
+toward the far end is discarded — and anything already received from it is
+still delivered. Re-attaching emits `EVT_ATTACH` and clears the fault back to
+`closed`, but does **not** re-open the port: the host must `OPEN` again.
+
+**Why.** `closed` is what a host asked for; `fault` is what happened to it.
+Collapsing the two would mean a host that had opened a port and never closed it
+could find it closed with no explanation, which is exactly the ambiguity the
+state exists to resolve. Discarding the outbound queue matters more than it
+looks: those bytes were addressed to a device that is gone, and holding them
+would deliver a firmware upload's tail to whatever gets plugged in next.
+
+Not auto-reopening is the same argument. The new device is a different device.
+It may be a different *kind* of device. Re-applying the old port settings to it
+without being asked is a guess, and `OPEN` is cheap.
+
+### D9. `STATUS` gains a `present` field rather than relying on events alone
+
+**Question.** A host connects to a device that already has an adapter
+attached. `EVT_ATTACH` was emitted before it was listening. How does it find
+out?
+
+**Decision.** A trailing `present` byte on `STATUS` (PROTOCOL.md §5.4), plus
+the events for changes. `waitForAttach()` on the host client reads the field
+first and only then waits for an event.
+
+**Why.** Inferring "nothing is attached" from the *absence* of an event is a
+negative inference over an asynchronous channel — it can only be implemented
+as a timeout, and a timeout cannot distinguish "nothing there" from "slow".
+One byte on a frame that already exists to answer "what is going on" removes
+the guesswork entirely.
+
+Appending it is backward compatible: a host that stops reading after `credit`
+never sees it, and its assumption that the far end is present is the right
+answer for every backend that cannot be unplugged.
+
+### D10. `INFO.caps` on this backend claims DTR, RTS and hot-plug — and nothing else
+
+**Question.** CDC/ACM is a richer interface than a bare UART. How much of it
+can we actually offer?
+
+**Decision.** `DTR`, `RTS`, `HOTPLUG`. Not `BREAK`, not `CTS`/`DSR`/`DCD`/`RI`,
+not RTS/CTS flow control.
+
+**Why.** Each absence is a specific missing API rather than a choice.
+`SEND_BREAK` exists in the CDC spec but TinyUSB's host driver does not expose
+it. The input lines arrive on the ACM notification endpoint as `SERIAL_STATE`,
+which TinyUSB consumes without surfacing — so we could neither report them in
+`STATUS` nor raise `EVT_LINES` for them honestly. Hardware flow control is a
+property of the adapter's far side, not something this protocol reaches.
+
+This is the same discipline as D5 and the phase 1 caps: a capability bit is a
+promise, and the failure mode of an over-claimed bit is a host waiting for an
+event that can never arrive.

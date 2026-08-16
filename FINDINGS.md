@@ -42,6 +42,52 @@ next person does not rediscover them.
 - `tud_task()` does not need pumping from `loop()`: the rp2040 port hangs a
   shared handler off `USBCTRL_IRQ` that raises a soft IRQ to run it.
 
+## TinyUSB as a USB *host* (phase 2, Pico-PIO-USB)
+
+- **The host stack is switched on by an include path, not by a flag.** The
+  core's `tusb_config_rp2040.h` does
+  `#if __has_include("pio_usb.h")` and enables `CFG_TUH_ENABLED` and
+  `CFG_TUH_RPI_PIO_USB` if it succeeds — otherwise it enables a MAX3421E host
+  instead. PlatformIO's dependency finder cannot see a conditional include, so
+  a bare `lib_deps` on Pico-PIO-USB is not enough: without an explicit
+  `-I$PROJECT_LIBDEPS_DIR/$PIOENV/Pico-PIO-USB/src` the firmware builds,
+  links and runs, and simply never enumerates anything. Worth checking for
+  real: `arm-none-eabi-nm firmware.elf | grep pio_usb_host_init` should hit,
+  and `grep max3421` should not.
+- Almost none of that config file is `#ifndef`-guarded, so build flags cannot
+  override it. `CFG_TUH_CDC_RX_BUFSIZE`/`TX_BUFSIZE` are fixed at 128 bytes and
+  `CFG_TUH_CDC_LINE_CONTROL_ON_ENUM` at `0x03` — meaning **TinyUSB asserts DTR
+  and RTS on the downstream device during enumeration**, before any of our code
+  runs. That resets most boards worth plugging in, and there is no supported
+  way to stop it. What we can do is not make it worse: the backend seeds its
+  idea of the lines from `tuh_cdc_get_dtr()`/`get_rts()` at mount, so `OPEN`
+  does not toggle DTR a second time on its way to a state it is already in.
+- `tuh_cdc_set_line_coding()` with a null callback is the one to use even
+  though `set_baudrate` and `set_data_format` exist: for FTDI, CP210x and CH34x
+  — which are not CDC at all, just re-using the driver API — it internally
+  falls back to issuing the two as separate requests.
+- **Blocking control transfers have no timeout.** `tuh_control_xfer()` spins on
+  `while (result == XFER_RESULT_INVALID) tuh_task_ext(0, false);` with a
+  `// TODO probably some timeout to prevent hanged` above it. An adapter that
+  stops answering therefore hangs the core running the host stack, for ever.
+  That is the reason the backend's mailbox is a timed handshake rather than a
+  direct call: core1 can hang, but core0 gives up after a second, keeps feeding
+  the watchdog, and the MIDI tunnel stays up to report `ERR_BACKEND`.
+- `Adafruit_USBH_Host::task()` defaults to `timeout_ms = UINT32_MAX`, which
+  blocks in the event queue until the USB stack has something to say. In a
+  `loop1()` that also has to move bytes, that default means the byte-moving
+  half runs only when USB happens to generate an event. `USBHost.task(0)`.
+- Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
+  default 125 MHz is not one. Setting it from `setup()` is too late — the core
+  has already configured peripherals against the old divisors — so it belongs
+  in `board_build.f_cpu`, which the core applies with `set_sys_clock_khz()`
+  before anything else starts.
+- arduino-pico launches core1 **before** `setup()` runs, not after
+  (`cores/rp2040/main.cpp`), so `setup1()` and `setup()` race by default. The
+  device and host stacks initialising concurrently is not a race worth finding
+  out about: one atomic flag, set at the end of `setup()` and spun on at the
+  top of `setup1()`, orders them.
+
 ## The Arduino UART layer (arduino-pico)
 
 - `SerialUART::write()` calls `uart_putc_raw()`, which **spins** until the

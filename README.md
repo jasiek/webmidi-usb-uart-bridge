@@ -17,7 +17,7 @@ SysEx cannot silently overrun a slow wire.
 | `DECISIONS.md`      | Why the project is shaped the way it is.                        |
 | `FINDINGS.md`       | Platform behaviour that was not obvious, learned the hard way.  |
 | `lib/bridge_proto/` | The protocol engine. No Arduino or RP2040 dependencies.         |
-| `src/`              | Firmware wiring: TinyUSB MIDI device, UART backend.             |
+| `src/`              | Firmware wiring: TinyUSB MIDI device, the two backends.         |
 | `test/`             | Unity tests for the engine, run on the host.                    |
 | `host/`             | Node client, software device model, loopback test rig.          |
 | `hardware/`         | Pinout, the loopback jumper, and the phase 2 PIO-USB notes.     |
@@ -33,9 +33,13 @@ PlatformIO is the build system. On this machine it lives at
 `~/.platformio/penv/bin/pio` rather than on `PATH`.
 
 ```sh
-# Firmware
+# Firmware — phase 1, hardware UART on GPIO0/1
 pio run -e pico                  # build
 pio run -e pico -t upload        # flash (hold BOOTSEL while plugging in)
+
+# Firmware — phase 2, USB CDC/ACM host port on GPIO16/17
+pio run -e pico_cdc
+pio run -e pico_cdc -t upload
 
 # Engine tests — no hardware needed
 pio test -e native
@@ -56,8 +60,15 @@ npm run probe                    # handshake only — no jumper needed
 npm run loopback                 # 9600 … 115200, 4 KB each way
 npm run loopback -- --baud 115200 --bytes 65536
 npm run loopback -- --fake       # no hardware; exercises the harness itself
+npm run loopback -- --fake-cdc   # same, modelling the phase 2 host port
 npm run throughput               # where the tunnel, not the UART, becomes the limit
 ```
+
+On a `pico_cdc` build the same commands apply, with a USB serial adapter in the
+host port instead of a jumper — loop **its** TX to **its** RX. `npm run probe`
+prints whether anything downstream enumerated, and `npm run loopback` waits for
+an adapter rather than failing if the port is empty, so plugging one in is a
+valid way to start the run.
 
 If the board ever stops answering, it recovers itself — a 4 s hardware watchdog
 reboots a hung `loop()`. To reflash without touching the board, open its CDC
@@ -108,9 +119,16 @@ caveat there about what a loopback can and cannot prove.
 - **Phase 1 — hardware UART: working, verified on hardware in both
   directions.** USB MIDI device, SysEx tunnel, credit windowing, control lines,
   test rig. 9600 → 460800 baud, zero loss.
-- **Phase 2 — Pico-PIO-USB CDC/ACM host: not started.** The `Backend`
-  interface and the `INFO.backend` field exist for it; `hardware/README.md`
-  records the pin and clock constraints it will impose.
+- **Phase 2 — Pico-PIO-USB CDC/ACM host: written, builds, not yet run on
+  hardware.** `pio run -e pico_cdc`. The USB host stack runs on core1 and
+  reaches the protocol engine on core0 through lock-free rings and a timed
+  mailbox (DECISIONS.md D7). ACM, FTDI, CP210x, CH34x and PL2303 adapters are
+  all covered by TinyUSB's host CDC driver. Hot-plug is reported as
+  `EVT_ATTACH`/`EVT_DETACH` and in `STATUS.present`; a detach faults the port
+  rather than closing it quietly (D8). The engine's half of that is under test
+  in `test/test_bridge` and `host/test/client.test.js`; **the USB host port
+  itself has never been powered up** — building it needs the resistors and
+  pull-downs in `hardware/README.md`.
 
 Known gaps in phase 1, all of them honest in `INFO.caps` rather than faked:
 DTR/DSR/DCD/RI have no pin on a bare UART; RTS/CTS are hardware flow control
