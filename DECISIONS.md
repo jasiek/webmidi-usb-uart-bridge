@@ -134,3 +134,51 @@ device whose entire purpose is being driven from a phone.
 The watchdog also turned out to be the diagnostic that mattered: it is what
 made the failure *visible* as `boot=WATCHDOG` rather than as an unexplained
 silence, and its scratch registers are what survived to name the hung phase.
+
+## 2026-08-16 — Toolchain
+
+### D7. One pinned toolchain, installed by `bootstrap.sh` via asdf
+
+**Question.** The project needs four things before anything can be built:
+PlatformIO, an RP2040 core, Node for the host client, and a Python for
+PlatformIO to run on. None of them was pinned, and `pio` lived wherever each
+machine's installer had left it. What installs them, and what fixes the
+versions?
+
+**Decision.** `./bootstrap.sh`, driven by three pinned files:
+
+| File               | Pins                                     |
+| ------------------ | ---------------------------------------- |
+| `.tool-versions`   | nodejs and python, installed by asdf     |
+| `requirements.txt` | PlatformIO, installed into `.venv/`      |
+| `platformio.ini`   | the RP2040 platform fork, by git tag     |
+
+The script installs asdf itself if it is absent — a pinned release, checked
+against a sha256 embedded in the script — then the runtimes, then PlatformIO,
+then the host's npm dependencies from the lockfile. It is idempotent, prints
+what it skipped, and exits non-zero on the first thing it cannot do.
+
+**Why asdf rather than the system package manager.** The versions have to be
+identical on macOS, on Linux and on a CI runner, and no package manager spans
+those three. `.tool-versions` is a file both asdf and mise read, and it is
+already the convention for exactly this.
+
+**Why PlatformIO lives in `.venv/` rather than in `.tool-versions`.** asdf has
+no PlatformIO plugin, and PlatformIO's own installer puts it in a global
+`~/.platformio/penv` shared by every project on the machine. A project-local
+virtualenv pins the version per checkout and is deleted by deleting a
+directory.
+
+**Why the RP2040 platform is now a git URL with a tag.** `platform = raspberrypi`
+resolves to the registry platform, which carries only the Arduino-mbed core and
+ignores `board_build.core = earlephilhower` without a word. FINDINGS.md recorded
+that months ago; `platformio.ini` did not act on it, so the firmware built only
+on machines where someone had once installed the fork by hand. On a clean
+checkout it failed on `<Arduino.h>`. Pinning the fork by tag is what makes
+"clone, bootstrap, build" true rather than nearly true.
+
+**Escape hatches, because a bootstrap that can only do one thing gets replaced.**
+`--no-asdf` uses the `node` and `python3` already on `PATH` and refuses them if
+they are not the pinned major version, which is what to use with
+`actions/setup-node`; `--check` verifies an install and changes nothing, which
+is what a CI job runs to fail fast with a legible message.

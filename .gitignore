@@ -7,6 +7,9 @@ compile_commands.json
 node_modules/
 npm-debug.log*
 
+# PlatformIO's virtualenv, created by ./bootstrap.sh
+.venv/
+
 *~
 .DS_Store
 

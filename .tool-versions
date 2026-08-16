@@ -1,0 +1,9 @@
+# Runtimes this repository is pinned to. Installed by ./bootstrap.sh via asdf.
+#
+# nodejs  host client and loopback rig (host/). 24 is the active LTS line;
+#         @julusian/midi is an N-API addon, so its prebuilt binaries load on it
+#         without a compiler. 22 also works if you have a reason to go back.
+# python  runs PlatformIO. The pinned PlatformIO version itself lives in
+#         requirements.txt, because asdf has no plugin for it.
+nodejs 24.19.0
+python 3.12.14
