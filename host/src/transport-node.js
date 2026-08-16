@@ -22,25 +22,38 @@ export function listPorts() {
   }
 }
 
-function findPort(port, needle) {
-  const wanted = needle.toLowerCase();
-  for (let i = 0; i < port.getPortCount(); i++) {
-    if (port.getPortName(i).toLowerCase().includes(wanted)) return i;
+// Several candidates, tried in order, because CoreMIDI caches port names by
+// VID/PID: a Mac that saw the board before its product descriptor was set will
+// go on calling it "Pico" no matter what the device now reports. See
+// FINDINGS.md — clearing that cache is the user's MIDI configuration, not
+// ours to delete.
+export const DEFAULT_PORT_MATCH = 'uart bridge,bridge,pico,rp2040';
+
+function findPort(port, needles) {
+  const names = [];
+  for (let i = 0; i < port.getPortCount(); i++) names.push(port.getPortName(i));
+  for (const needle of needles) {
+    const wanted = needle.trim().toLowerCase();
+    if (!wanted) continue;
+    const hit = names.findIndex((name) => name.toLowerCase().includes(wanted));
+    if (hit >= 0) return hit;
   }
   return -1;
 }
 
 export class NodeMidiTransport {
   /**
-   * @param {string} [match] substring of the port name, case-insensitive
+   * @param {string} [match] comma-separated name substrings, tried in order,
+   *   case-insensitive
    */
-  constructor(match = 'bridge') {
+  constructor(match = DEFAULT_PORT_MATCH) {
+    const needles = match.split(',');
     this.input = new midi.Input();
     this.output = new midi.Output();
     this.handler = null;
 
-    const inIndex = findPort(this.input, match);
-    const outIndex = findPort(this.output, match);
+    const inIndex = findPort(this.input, needles);
+    const outIndex = findPort(this.output, needles);
     if (inIndex < 0 || outIndex < 0) {
       const { inputs, outputs } = listPorts();
       this.input.closePort();

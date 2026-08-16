@@ -60,6 +60,28 @@ next person does not rediscover them.
   *mode* on this backend, not lines the host can poke — hence `kCapFlowRtsCts`
   without `kCapRts`/`kCapCts`.
 
+## On real hardware
+
+- **CoreMIDI caches MIDI port names by VID/PID.** Setting
+  `TinyUSBDevice.setProductDescriptor("UART Bridge")` changes what the USB
+  descriptor reports — `ioreg` confirms it immediately — but a Mac that has
+  already seen the board goes on calling the MIDI port "Pico" indefinitely.
+  The USB descriptor and the MIDI port name are not the same string as far as
+  macOS is concerned. Rather than delete the user's MIDI configuration, the
+  host tools try several name candidates in order (`DEFAULT_PORT_MATCH`).
+- The interface string descriptor (`usb_midi.setStringDescriptor`) is *not*
+  what macOS surfaces as the port name; the device product descriptor is.
+  Setting only the former, as the Adafruit examples do, leaves the port named
+  after the board.
+- Measured round-trip latency for a `PING`/`PONG` over USB MIDI is **≈1 ms**
+  (0.77 ms best of 10). SysEx through CoreMIDI is not the bottleneck anyone
+  worries it will be.
+- A floating RX pin is not silent. With no loopback jumper, an all-zeros
+  payload on the adjacent TX pin produced 124 "received" bytes out of 256 via
+  crosstalk, with no error flags — because the core's ISR discards framing
+  errors silently (see above). An incrementing payload produced none. If a
+  loopback test half-works, suspect the wire before the code.
+
 ## The host client
 
 - **Never `unref()` a timer that carries protocol traffic.** Both the credit

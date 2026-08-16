@@ -46,11 +46,13 @@ cd host && npm install && npm test
 
 ## The loopback test
 
-Jumper **GPIO0 to GPIO1** on the Pico — that is the entire test rig. Then:
+Jumper **GPIO0 (pin 1) to GPIO1 (pin 2)** on the Pico — that is the entire test
+rig. Then:
 
 ```sh
 cd host
 npm run list                     # confirm the Pico enumerated, and under what name
+npm run probe                    # handshake only — no jumper needed
 npm run loopback                 # 9600 … 115200, 4 KB each way
 npm run loopback -- --baud 115200 --bytes 65536
 npm run loopback -- --fake       # no hardware; exercises the harness itself
@@ -65,10 +67,27 @@ model of the firmware with its TX looped to its RX. It is how the harness gets
 debugged before hardware is involved, and how the client's flow control is
 tested in CI.
 
+## Measured on hardware
+
+Flashed to a Pico 1 and driven from macOS over CoreMIDI:
+
+| Measurement                            | Result                          |
+| -------------------------------------- | ------------------------------- |
+| `PING`/`PONG` round trip                | 0.97 ms mean, 0.77 ms best      |
+| 64 KB host → UART at 115200 8N1         | 11.2 kB/s, **99% of line rate** |
+| Bytes delivered vs. sent                | 65536 / 65536, exact            |
+| Sequence gaps, credit errors, overruns  | none                            |
+
+The credit window paced a 64 KB write through a 2048-byte device buffer down to
+the UART's own drain rate without a single dropped byte — which is the whole
+reason §6 exists.
+
+The UART → host direction still needs the loopback jumper to be verified.
+
 ## Status
 
-- **Phase 1 — hardware UART: working.** USB MIDI device, SysEx tunnel, credit
-  windowing, control lines, loopback test rig.
+- **Phase 1 — hardware UART: working, host → UART verified on hardware.** USB
+  MIDI device, SysEx tunnel, credit windowing, control lines, test rig.
 - **Phase 2 — Pico-PIO-USB CDC/ACM host: not started.** The `Backend`
   interface and the `INFO.backend` field exist for it; `hardware/README.md`
   records the pin and clock constraints it will impose.

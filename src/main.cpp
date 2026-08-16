@@ -62,6 +62,13 @@ void setup() {
   // is what makes the host re-read the descriptors.
   if (!TinyUSBDevice.isInitialized()) TinyUSBDevice.begin(0);
 
+  // The product descriptor is what CoreMIDI names the port, and what the host
+  // tools match on by default — not the interface string below, which macOS
+  // does not surface. Leaving it as the core's "Pico" makes every board on the
+  // bench look identical.
+  TinyUSBDevice.setManufacturerDescriptor("webmidi-usb-uart-bridge");
+  TinyUSBDevice.setProductDescriptor("UART Bridge");
+
   usbMidi.setStringDescriptor("UART Bridge");
   usbMidi.begin();
 

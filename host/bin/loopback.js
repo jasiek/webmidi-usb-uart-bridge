@@ -13,13 +13,13 @@
 import { BridgeClient } from '../src/client.js';
 import { Cap, ErrFlag, BackendId } from '../src/constants.js';
 import { FakeDevice } from '../src/fake-device.js';
-import { NodeMidiTransport } from '../src/transport-node.js';
+import { DEFAULT_PORT_MATCH, NodeMidiTransport } from '../src/transport-node.js';
 
 const DEFAULT_BAUDS = [9600, 19200, 38400, 57600, 115200];
 
 function parseArgs(argv) {
   const args = {
-    port: 'bridge',
+    port: DEFAULT_PORT_MATCH,
     bauds: DEFAULT_BAUDS,
     bytes: 4096,
     fake: false,
