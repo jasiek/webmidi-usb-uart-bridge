@@ -14,13 +14,38 @@
 #include "midi_sink.h"
 #include "sysex_assembler.h"
 #include "usb_lock.h"
+
+// Which far end this build drives. One interface, two backends — DECISIONS.md
+// D1. The MIDI side, the protocol engine and the host tools are identical
+// either way; only these few lines and the core1 block at the bottom differ.
+#ifdef BRIDGE_BACKEND_CDC_HOST
+#include <hardware/clocks.h>
+#include <pio_usb.h>
+
+#include <atomic>
+
+#include "cdc_host_backend.h"
+#else
 #include "uart_backend.h"
+#endif
 
 namespace {
 
 Adafruit_USBD_MIDI usbMidi;
 
+#ifdef BRIDGE_BACKEND_CDC_HOST
+// The instance lives in the backend's own translation unit, because TinyUSB's
+// C callbacks fire on core1 and have to reach it.
+bridge::Backend& backend = bridge::gCdcHost;
+Adafruit_USBH_Host USBHost;
+// core1 must not touch the USB host stack until core0 has the device side up:
+// arduino-pico launches core1 *before* setup() runs (cores/rp2040/main.cpp),
+// so without this the two stacks initialise concurrently.
+std::atomic<bool> deviceReady{false};
+#else
 bridge::UartBackend backend;
+#endif
+
 bridge::UsbMidiSink sink;
 bridge::Bridge gBridge(backend, sink);
 
@@ -39,6 +64,8 @@ constexpr uint32_t kWatchdogMs = 4000;
 // The on-board LED doubles as the only status output this board has: slow
 // heartbeat when idle, solid once a port is open.
 constexpr uint32_t kHeartbeatMs = 1000;
+// Attached but not open, on a backend that knows the difference.
+constexpr uint32_t kAttachedBlinkMs = 150;
 uint32_t lastBlinkAt = 0;
 
 // Counters, kept unconditionally — three increments per loop is nothing, and
@@ -90,6 +117,7 @@ const char* phaseName(unsigned code) {
     case 13: return "poll/credit";
     case 14: return "poll/sendDataChunk";
     case 15: return "poll (done)";
+    case 16: return "poll/pumpPresence";
     default: return "none";
   }
 }
@@ -142,6 +170,27 @@ void serviceDebug(uint32_t nowMs) {
       static_cast<unsigned long>(phaseMax.poll),
       static_cast<unsigned long>(phaseMax.sink),
       static_cast<unsigned long>(phaseMax.loop));
+
+#ifdef BRIDGE_BACKEND_CDC_HOST
+  // A second line for the far end, because on this backend almost every
+  // bring-up question is about core1: is the host port running at all
+  // (host_tasks climbing), did the adapter enumerate (attached), and is the
+  // mailbox getting answers (op_timeouts flat).
+  if (SerialTinyUSB.availableForWrite() >= 96) {
+    SerialTinyUSB.printf(
+        "    cdc: clk=%luMHz%s attached=%d host_tasks=%lu to_dev=%lu"
+        " from_dev=%lu op_timeouts=%lu lines=0x%02x\r\n",
+        static_cast<unsigned long>(clock_get_hz(clk_sys) / 1000000u),
+        bridge::gCdcHost.clockOk() ? "" : " BAD(not a multiple of 12)",
+        bridge::gCdcHost.present() ? 1 : 0,
+        static_cast<unsigned long>(bridge::gCdcHost.hostTasks()),
+        static_cast<unsigned long>(bridge::gCdcHost.bytesToDevice()),
+        static_cast<unsigned long>(bridge::gCdcHost.bytesFromDevice()),
+        static_cast<unsigned long>(bridge::gCdcHost.opTimeouts()),
+        bridge::gCdcHost.outputLines());
+  }
+#endif
+
   phaseMax.clear();
 }
 #else
@@ -153,7 +202,14 @@ void serviceLed(uint32_t nowMs) {
     digitalWrite(LED_BUILTIN, HIGH);
     return;
   }
-  if (nowMs - lastBlinkAt < kHeartbeatMs) return;
+  // On a backend that can tell the difference, "something is plugged into the
+  // host port but no port is open on it" gets its own fast blink. During
+  // bring-up that is the question — did the adapter enumerate at all — and
+  // this LED is the only status output the board has.
+  const bool hotplug = (backend.caps() & bridge::kCapHotplug) != 0;
+  const uint32_t interval =
+      (hotplug && backend.present()) ? kAttachedBlinkMs : kHeartbeatMs;
+  if (nowMs - lastBlinkAt < interval) return;
   lastBlinkAt = nowMs;
   digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 }
@@ -243,6 +299,13 @@ void setup() {
 
   gBridge.begin(millis());
   rp2040.wdt_begin(kWatchdogMs);
+
+#ifdef BRIDGE_BACKEND_CDC_HOST
+  // Last thing in setup(): core1 has been spinning on this since before we
+  // started, and it is what lets the USB host port come up after the device
+  // side rather than alongside it.
+  deviceReady.store(true, std::memory_order_release);
+#endif
 }
 
 void loop() {
@@ -280,3 +343,42 @@ void loop() {
   // Deliberately no delay(): at 115200 baud the UART produces a byte every
   // 87 µs, and the RP2040 has nothing else to do with the time.
 }
+
+#ifdef BRIDGE_BACKEND_CDC_HOST
+
+// ---- core1: the USB host port ----------------------------------------------
+//
+// Pico-PIO-USB reconstructs a full-speed bus out of two PIO state machines and
+// an interrupt that has to be serviced inside a bit time. The RP2040's own USB
+// device controller — the MIDI side — has an interrupt of its own and will not
+// yield, so the host stack gets this core to itself. Everything it shares with
+// core0 goes through CdcHostBackend; see the comment at the top of
+// cdc_host_backend.h for the split.
+//
+// Nothing here feeds the watchdog. That is on purpose: core0 owns liveness,
+// and a core1 wedged inside a control transfer to a misbehaving adapter should
+// leave the MIDI tunnel up to say so, not reboot the board out from under the
+// host that is asking.
+
+void setup1() {
+  while (!deviceReady.load(std::memory_order_acquire)) tight_loop_contents();
+
+  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+  pio_cfg.pin_dp = bridge::kPinUsbDp;  // D− is implicitly the next GPIO up
+  USBHost.configure_pio_usb(1, &pio_cfg);
+  USBHost.begin(1);
+
+  bridge::gCdcHost.beginHost();
+}
+
+void loop1() {
+  // task(0), not the default: Adafruit_USBH_Host::task() passes its timeout
+  // straight to tuh_task_ext(), and the default of UINT32_MAX blocks in the
+  // event queue until something happens — which would mean serviceHost() only
+  // ran when the USB stack felt like it, and never while bytes were merely
+  // waiting in a ring.
+  USBHost.task(0);
+  bridge::gCdcHost.serviceHost();
+}
+
+#endif  // BRIDGE_BACKEND_CDC_HOST
