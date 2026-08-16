@@ -19,9 +19,13 @@
 //     the only thing on the hot path.
 //   * Control operations (open, close, set lines, flush) are posted to core1
 //     through a single-slot mailbox and *waited on*. They are rare — a handful
-//     per session — and being synchronous is what makes them safe: while core0
-//     is waiting it is provably not touching the rings, which is what lets
-//     core1 clear them for a flush.
+//     per session — and being synchronous is what lets a caller report the
+//     result: open() has to say whether the adapter accepted the line coding.
+//
+// Emptying a ring is not one of the things the handshake is trusted for. Core0
+// gives up on an op after a second, so "core0 is blocked, therefore quiet" is
+// an invariant with a hole in it; each ring is instead emptied by the core
+// that consumes it, which is safe on its own. See executeOp().
 #pragma once
 
 #include <Arduino.h>
@@ -109,10 +113,17 @@ class CdcHostBackend : public Backend {
   bool clockOk() const { return clockOk_; }
 
  private:
-  // The mailbox. Core0 fills the argument fields, stores `op_`, and spins
-  // until core1 zeroes it again.
+  // The mailbox. Core0 claims the slot, fills the argument fields, stores the
+  // op code, and spins until core1 zeroes it again.
+  //
+  // `Claimed` is what makes that order safe. The arguments are written *after*
+  // the slot is taken and *before* the op code that publishes them, so a
+  // caller arriving while core1 still owns a previous op is turned away
+  // before it can touch anything core1 might be reading. Core1 treats it
+  // exactly like None: nothing to do yet.
   enum class Op : uint8_t {
     None = 0,
+    Claimed,
     Open,
     Close,
     SetLines,
@@ -125,7 +136,8 @@ class CdcHostBackend : public Backend {
   // the 4 s watchdog.
   static constexpr uint32_t kOpTimeoutMs = 1000;
 
-  bool runOp(Op op);           // core0: post and wait. False on timeout.
+  bool claimOp();              // core0: take the mailbox, or fail if it is busy
+  bool runOp(Op op);           // core0: publish a claimed op and wait for it.
   void executeOp();            // core1: perform whatever core0 posted.
   bool applyLineCoding();      // core1
   bool applyControlLines();    // core1
@@ -141,10 +153,13 @@ class CdcHostBackend : public Backend {
 
   std::atomic<uint8_t> op_{static_cast<uint8_t>(Op::None)};
   std::atomic<bool> opOk_{false};
-  // Only read by core1 while core0 is blocked in runOp(), so it needs no
-  // atomicity of its own — the op_ release/acquire pair publishes it.
+  // Arguments to whatever op_ names. Written by core0 only while it holds the
+  // mailbox and only between claimOp() and runOp(), so they need no atomicity
+  // of their own — the op_ release/acquire pair publishes them, and the claim
+  // is what stops a second caller overwriting them mid-flight.
   PortConfig pending_;
   uint8_t pendingFlush_ = 0;
+  uint8_t pendingLines_ = 0;
 
   SpscRing<kHostRingSlots> toDevice_;    // core0 produces, core1 consumes
   SpscRing<kHostRingSlots> fromDevice_;  // core1 produces, core0 consumes

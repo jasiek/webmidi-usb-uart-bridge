@@ -101,6 +101,19 @@ next person does not rediscover them.
   That is the reason the backend's mailbox is a timed handshake rather than a
   direct call: core1 can hang, but core0 gives up after a second, keeps feeding
   the watchdog, and the MIDI tunnel stays up to report `ERR_BACKEND`.
+- A single-slot mailbox has to be **claimed before its arguments are written**,
+  not checked afterwards. The first version of `runOp()` had callers fill in
+  `pending_` / `pendingFlush_` and *then* call a function whose first act was
+  to refuse if core1 still owned the previous op — by which point the
+  arguments core1 was reading had already been overwritten. The guard was
+  guarding a door it had already walked through. The check-and-claim is one
+  compare-exchange and reads no worse.
+- **An SPSC ring can be emptied safely by its consumer and only by its
+  consumer.** `discard(n)` moves the tail, which the consumer already owns, so
+  it races nothing; `clear()` resets both indices and is only safe when the
+  other core is quiet. Relying on "core0 is blocked in the handshake, so it is
+  quiet" does not work here, because the handshake gives up after a second and
+  the op it abandoned still runs later — see DECISIONS.md D11.
 - `Adafruit_USBH_Host::task()` defaults to `timeout_ms = UINT32_MAX`, which
   blocks in the event queue until the USB stack has something to say. In a
   `loop1()` that also has to move bytes, that default means the byte-moving

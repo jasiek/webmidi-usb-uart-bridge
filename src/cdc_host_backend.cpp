@@ -47,8 +47,16 @@ uint16_t CdcHostBackend::caps() const {
 
 bool CdcHostBackend::open(const PortConfig& cfg) {
   if (!present()) return false;  // nothing to open a port on
+  // Claim before writing pending_: an OPEN arriving while core1 still owns a
+  // timed-out op must be refused, not allowed to rewrite the arguments that op
+  // is in the middle of reading.
+  if (!claimOp()) return false;
   pending_ = cfg;
   if (!runOp(Op::Open)) return false;
+  // Ours to drop because core0 is this ring's consumer — see the note on
+  // executeOp(). Done after the op rather than before it, so anything core1
+  // moved across before it cleared the adapter's FIFO goes too.
+  fromDevice_.discard(fromDevice_.size());
   open_.store(true, std::memory_order_release);
   return true;
 }
@@ -58,6 +66,7 @@ void CdcHostBackend::close() {
   // to stop moving bytes. The reverse would let a write() land in a ring that
   // core1 has already stopped draining.
   open_.store(false, std::memory_order_release);
+  if (!claimOp()) return;
   (void)runOp(Op::Close);
 }
 
@@ -82,8 +91,15 @@ size_t CdcHostBackend::read(uint8_t* p, size_t n) { return fromDevice_.read(p, n
 
 void CdcHostBackend::flush(uint8_t what) {
   if (!present()) return;
+  if (!claimOp()) return;
   pendingFlush_ = what;
-  (void)runOp(Op::Flush);
+  const bool ok = runOp(Op::Flush);
+  // Core0 owns this ring's consumer end, so dropping its contents here needs
+  // no cooperation from core1 at all — see the note on executeOp(). Only if
+  // the op really ran, though: a FLUSH that timed out has not cleared the
+  // adapter's own FIFO, and throwing away our copy would be a loss on top of
+  // a failure rather than the discard the host asked for.
+  if (ok && (what & kFlushDiscardRx)) fromDevice_.discard(fromDevice_.size());
 }
 
 void CdcHostBackend::setLines(uint8_t mask, uint8_t values) {
@@ -95,6 +111,11 @@ void CdcHostBackend::setLines(uint8_t mask, uint8_t values) {
   if (wanted == (before & (kLineDtr | kLineRts))) return;
   outLines_.store(wanted, std::memory_order_release);
   if (!present()) return;
+  if (!claimOp()) return;
+  // The value to put on the wire is staged separately from outLines_, which is
+  // core0's record of what the host asked for and can move again at any time.
+  // What core1 applies has to be the state this call was made about.
+  pendingLines_ = wanted;
   // Backend::setLines returns void, so there is nowhere to report a failed
   // control transfer to — STATUS will go on reporting what the host asked for
   // rather than what the adapter acknowledged. The two only diverge when the
@@ -120,17 +141,31 @@ uint8_t CdcHostBackend::takeErrorFlags() {
 
 // ---- the mailbox -----------------------------------------------------------
 
-bool CdcHostBackend::runOp(Op op) {
-  // A previous op that timed out is still owned by core1; posting over it
-  // would corrupt its arguments mid-flight.
-  if (op_.load(std::memory_order_acquire) != static_cast<uint8_t>(Op::None)) {
-    ++opTimeouts_;
-    return false;
-  }
+bool CdcHostBackend::claimOp() {
+  // A previous op that timed out is still owned by core1, and its arguments
+  // are still being read. Taking the slot is therefore the first thing a
+  // caller does, before it writes anything: checking afterwards would be
+  // checking a lock we had already broken.
+  //
+  // Only core0 ever stores a non-None value, so a plain load and store would
+  // do — the compare-exchange is here because it says what is meant.
+  uint8_t expected = static_cast<uint8_t>(Op::None);
+  if (op_.compare_exchange_strong(expected, static_cast<uint8_t>(Op::Claimed),
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire))
+    return true;
 
+  // Counted with the timeouts because that is what it means: the only way the
+  // mailbox is still busy is that an earlier op has not come back.
+  ++opTimeouts_;
+  return false;
+}
+
+bool CdcHostBackend::runOp(Op op) {
   opOk_.store(false, std::memory_order_relaxed);
-  // Release: pending_ / pendingFlush_ / outLines_ are published before the op
-  // code that tells core1 to read them.
+  // Release: pending_ / pendingFlush_ / pendingLines_, written by the caller
+  // since it claimed the slot, are published before the op code that tells
+  // core1 to read them.
   op_.store(static_cast<uint8_t>(op), std::memory_order_release);
 
   const uint32_t startedAt = millis();
@@ -154,9 +189,24 @@ void CdcHostBackend::beginHost() {
   clockOk_ = (clock_get_hz(clk_sys) % 12000000u) == 0;
 }
 
+// Each ring is emptied by whichever core consumes it, never by the other:
+// core1 drops what is left in toDevice_, core0 drops what is left in
+// fromDevice_. `discard()` only moves the consumer's own tail index, so it is
+// safe against a producer running flat out on the other core and needs no
+// agreement about who is blocked when.
+//
+// SpscRing::clear() would be the obvious call and is the wrong one. It resets
+// both indices, so it is only safe while the *other* core is quiet — an
+// invariant the synchronous mailbox usually provides and cannot promise,
+// because core0 abandons an op after a second (FINDINGS.md: TinyUSB's blocking
+// control transfer has no timeout, so core1 can be stuck inside one). Exactly
+// then, with core0 running again and core1 arriving late at the op, clear()
+// would be racing the very core it was supposed to be excluding.
 void CdcHostBackend::executeOp() {
   const Op op = static_cast<Op>(op_.load(std::memory_order_acquire));
-  if (op == Op::None) return;
+  // Claimed means core0 has taken the mailbox but has not finished filling it
+  // in. Nothing to read yet.
+  if (op == Op::None || op == Op::Claimed) return;
 
   bool ok = false;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
@@ -164,11 +214,7 @@ void CdcHostBackend::executeOp() {
 
   switch (op) {
     case Op::Open:
-      // Both rings are cleared here rather than on core0, because core0 is
-      // blocked in runOp() for exactly as long as this takes — which is the
-      // only window in which clearing them cannot race the other core.
-      toDevice_.clear();
-      fromDevice_.clear();
+      toDevice_.discard(toDevice_.size());
       if (mounted) {
         tuh_cdc_read_clear(idx);
         tuh_cdc_write_clear(idx);
@@ -177,7 +223,7 @@ void CdcHostBackend::executeOp() {
       break;
 
     case Op::Close:
-      toDevice_.clear();
+      toDevice_.discard(toDevice_.size());
       ok = true;
       break;
 
@@ -187,11 +233,12 @@ void CdcHostBackend::executeOp() {
 
     case Op::Flush:
       if (pendingFlush_ & kFlushDiscardTx) {
-        toDevice_.clear();
+        toDevice_.discard(toDevice_.size());
         if (mounted) tuh_cdc_write_clear(idx);
       }
       if (pendingFlush_ & kFlushDiscardRx) {
-        fromDevice_.clear();
+        // Only the adapter's FIFO here; the ring is core0's to empty, and it
+        // does so as soon as this op comes back to it.
         if (mounted) tuh_cdc_read_clear(idx);
       }
       if (pendingFlush_ & kFlushDrainTx) {
@@ -205,6 +252,7 @@ void CdcHostBackend::executeOp() {
       break;
 
     case Op::None:
+    case Op::Claimed:
       break;
   }
 
@@ -236,9 +284,8 @@ bool CdcHostBackend::applyLineCoding() {
 }
 
 bool CdcHostBackend::applyControlLines() {
-  const uint8_t wanted = outLines_.load(std::memory_order_acquire);
   // kLineDtr/kLineRts are bits 0 and 1, and so are CDC's DTR and RTS.
-  const uint16_t state = wanted & (kLineDtr | kLineRts);
+  const uint16_t state = pendingLines_ & (kLineDtr | kLineRts);
 
   xfer_result_t result = XFER_RESULT_INVALID;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
@@ -315,12 +362,12 @@ void CdcHostBackend::onMount(uint8_t idx) {
 void CdcHostBackend::onUnmount(uint8_t idx) {
   if (idx != cdcIdx_.load(std::memory_order_relaxed)) return;
   mounted_.store(false, std::memory_order_release);
-  // Deliberately not clearing toDevice_ here. Whatever core0 queued for a
-  // device that is gone is undeliverable, but core0 owns that ring's producer
-  // end and could be inside write() right now — clearing it from this core
-  // would race. The engine calls close() on seeing the detach, and Op::Close
-  // clears it from here with core0 provably blocked. What came *from* the
-  // adapter is left alone either way, so its last bytes still reach the host.
+  // Deliberately not dropping toDevice_ here, even though this core could do
+  // it safely. The engine calls close() on seeing the detach and Op::Close is
+  // where that belongs, so there is one place that decides an unplugged device
+  // means the queue is undeliverable rather than two that have to agree. What
+  // came *from* the adapter is left alone either way, so its last bytes still
+  // reach the host.
 }
 
 }  // namespace bridge

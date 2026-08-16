@@ -231,3 +231,37 @@ property of the adapter's far side, not something this protocol reaches.
 This is the same discipline as D5 and the phase 1 caps: a capability bit is a
 promise, and the failure mode of an over-claimed bit is a host waiting for an
 event that can never arrive.
+
+## 2026-08-16 — Phase 2 review
+
+### D11. A ring is emptied by the core that consumes it, never by the other one
+
+**Question.** D7 argued that the synchronous mailbox is what makes `OPEN` and
+`FLUSH` able to empty the cross-core rings: core0 is blocked in `runOp()` while
+core1 runs the op, so core1 can call `SpscRing::clear()` without racing
+anyone. Does that hold?
+
+**Decision.** No, and the rings are no longer cleared that way. `toDevice_` is
+emptied by core1 and `fromDevice_` by core0 — in both cases by the core that
+owns the ring's *consumer* end, calling `discard(size())`, which touches only
+that core's own tail index. `clear()` stays in `spsc_ring.h` for the
+initialisation case and is not called across cores at all.
+
+**Why.** The invariant D7 relied on has a hole in it, and the hole is the
+timeout D7 itself introduced. Core0 gives up after a second precisely because
+core1 can be stuck for ever inside a TinyUSB control transfer (FINDINGS.md).
+When it does give up, core1 still owns the op and will still run it whenever it
+comes back — and by then core0 is running again. `clear()` resets both indices,
+so at exactly that moment it would be racing the core it was meant to exclude.
+Nothing in the old code could tell the two cases apart.
+
+A consumer-side `discard()` needs no such agreement. The producer only ever
+writes `head_` and the consumer only ever writes `tail_`, so dropping the
+unread remainder is the same operation as reading it and throwing it away, and
+is safe against a producer running flat out. The rule is now a property of the
+data structure rather than of the handshake wrapped around it, which is the
+kind of safety that survives someone changing the handshake.
+
+The mailbox stays synchronous, for the reason that was always the strongest
+one: `open()` has to be able to tell the engine whether the adapter accepted
+the line coding.
