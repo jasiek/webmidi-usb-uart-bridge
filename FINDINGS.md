@@ -265,6 +265,28 @@ plenty.
   and they are not interoperable. `PROTOCOL.md` §2 pins ours down with a worked
   example, and `test_spec_vector` asserts it, so a future reimplementation
   cannot silently drift.
+- **A session boundary has to be enforced on both sides of the link and in
+  both of the places a frame can be sitting.** Clearing the outbound *buffer*
+  at `OPEN` is not enough: anything already framed and handed to the USB sink
+  is past that point, and arrives in the next session carrying the previous
+  session's sequence number. `sink_.discardQueued()` is the other half. On the
+  host the mirror image applies — resetting the client's session before
+  sending `OPEN` counts the old session's tail against the new sequence, so it
+  has to happen after the `STATUS` reply, which ordered SysEx guarantees comes
+  last.
+- **A feature that is announced in the spec can be entirely absent from the
+  wire while the code that implements it looks complete.** The post-close
+  drain (§5.9) was defeated by an allow-list two functions away — `CREDIT` was
+  answered `ERR_NOT_OPEN`, so it stopped after one window, 64 bytes of 300.
+  Nothing in the drain itself was wrong. Measuring how many bytes actually
+  arrive is the only check that catches that class of bug.
+- **Presence has to be watched as an edge, not a level.** A far end unplugged
+  and replaced between two polls reads identically on both sides of the gap.
+  The port stays open, against a device TinyUSB has meanwhile re-enumerated
+  and reset to its own defaults — so the host is talking to a stranger on a
+  port it believes it configured. `Backend::presence()` returns the level and
+  a flip count in one word, so a reader cannot get a level from one transition
+  and a count from another.
 - Credits have to be cumulative deltas rather than absolute levels. With
   absolute levels a lost message leaves the sender believing it has *more*
   window than the receiver has buffer, which overflows silently; with deltas
