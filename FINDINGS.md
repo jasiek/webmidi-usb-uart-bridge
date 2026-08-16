@@ -48,12 +48,40 @@ next person does not rediscover them.
   core's `tusb_config_rp2040.h` does
   `#if __has_include("pio_usb.h")` and enables `CFG_TUH_ENABLED` and
   `CFG_TUH_RPI_PIO_USB` if it succeeds — otherwise it enables a MAX3421E host
-  instead. PlatformIO's dependency finder cannot see a conditional include, so
-  a bare `lib_deps` on Pico-PIO-USB is not enough: without an explicit
-  `-I$PROJECT_LIBDEPS_DIR/$PIOENV/Pico-PIO-USB/src` the firmware builds,
-  links and runs, and simply never enumerates anything. Worth checking for
-  real: `arm-none-eabi-nm firmware.elf | grep pio_usb_host_init` should hit,
-  and `grep max3421` should not.
+  instead. The `lib_deps` entry on Pico-PIO-USB is what makes it succeed, and
+  it is sufficient on its own: PlatformIO puts the checked-out library's
+  `src/` on the include path of every library that depends on it, Adafruit
+  TinyUSB included, so the conditional resolves during TinyUSB's own
+  compilation. No `-I` of ours is needed.
+- **The `-I` we had for this was a no-op, and the reason we thought we needed
+  it was wrong.** It read
+  `-I$PROJECT_LIBDEPS_DIR/$PIOENV/Pico-PIO-USB/src`, which names a directory
+  that has never existed: PlatformIO checks the dependency out under the name
+  in its `library.json`, which is `Pico PIO USB` — with spaces. The comment
+  above it claimed that without the flag the build falls back to a MAX3421E
+  host. It does not. On a clean `pio run -e pico_cdc` with the flag deleted,
+  `hcd_pio_usb.c.o` is 5228 bytes with 18 text symbols and `hcd_max3421.c.o`
+  is 672 bytes with none, and `pio_usb_host_init` is in the ELF while nothing
+  matching `max3421` is — i.e. `CFG_TUH_RPI_PIO_USB` is 1 and the MAX3421
+  driver is compiled out to nothing. That is byte-for-byte what the build
+  produced *with* the flag, which is the point.
+- The way to check this for real, and the only way worth trusting, is at the
+  object level rather than by reading the ini:
+
+  ```
+  cd '.pio/build/pico_cdc/libebb/Adafruit TinyUSB Library/portable'
+  arm-none-eabi-nm raspberrypi/pio_usb/hcd_pio_usb.c.o | grep -c ' [Tt] '   # 18
+  arm-none-eabi-nm analog/max3421/hcd_max3421.c.o      | grep -c ' [Tt] '   # 0
+  arm-none-eabi-nm .pio/build/pico_cdc/firmware.elf | grep pio_usb_host_init
+  ```
+
+  The toolchain's `nm` is at
+  `~/.platformio/packages/toolchain-rp2040-earlephilhower/bin/`, not on `PATH`.
+- PlatformIO quotes the include paths it generates, so the space in
+  `Pico PIO USB` is not a problem for it: `pio run -v` shows
+  `"-I.pio/libdeps/pico_cdc/Pico PIO USB/src"` as one argument. A hand-written
+  `-I` for the same directory would have to be quoted the same way, which is
+  the other half of why the one we had could never have worked.
 - Almost none of that config file is `#ifndef`-guarded, so build flags cannot
   override it. `CFG_TUH_CDC_RX_BUFSIZE`/`TX_BUFSIZE` are fixed at 128 bytes and
   `CFG_TUH_CDC_LINE_CONTROL_ON_ENUM` at `0x03` — meaning **TinyUSB asserts DTR
