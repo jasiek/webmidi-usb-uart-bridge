@@ -205,9 +205,13 @@ static void feedSimple(Cmd cmd) {
   br->onSysEx(buf, n, clockMs);
 }
 
+// Gets to a known open port and forgets how we got there — including the
+// discard OPEN itself performs, so a test that counts discards is counting
+// only the ones it caused.
 static void openPort(uint16_t hostWindow = kRxBufferSize) {
   feed(buildOpen(115200, hostWindow));
   sink->clear();
+  sink->discards = 0;
 }
 
 static void tick(uint32_t advanceMs = 1) {
@@ -745,6 +749,68 @@ static void test_reset_discards_stale_output(void) {
   TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(Rsp::Status), sink->frames[0].cmd);
 }
 
+// ---- the session boundary (PROTOCOL.md §5.9) -------------------------------
+
+// The device keeps delivering what it received before the port closed, and
+// that delivery is credit-paced like any other. With CREDIT answered
+// ERR_NOT_OPEN the drain stopped at whatever window happened to be left —
+// here 64 of 300 bytes, with the other 236 stranded in a buffer nothing would
+// ever empty, and an error frame the host had not asked for on top.
+static void test_the_tail_of_a_closed_session_is_credited_out(void) {
+  openPort(64);  // a window small enough that the tail needs several grants
+  for (int i = 0; i < 300; ++i)
+    backend->incoming.push_back(static_cast<uint8_t>(i));
+  tick();
+  TEST_ASSERT_EQUAL_size_t(64, collectData().size());
+
+  sink->clear();
+  feedSimple(Cmd::Close);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Closed),
+                        static_cast<int>(br->state()));
+
+  // The host reads what it was sent and hands the window back, port or no port.
+  for (int round = 0; round < 10; ++round) {
+    feedCredit(64);
+    tick();
+  }
+
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, sink->count(Rsp::Error),
+                                "CREDIT on a closed port must not be an error");
+  const std::vector<uint8_t> got = collectData(1);
+  TEST_ASSERT_EQUAL_size_t(236, got.size());
+  for (size_t i = 0; i < got.size(); ++i)
+    TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(64 + i), got[i]);
+}
+
+// The other half of the same bargain. Delivery outlives the port, so OPEN has
+// to be a hard boundary — and clearing toHost_ is not enough, because frames
+// that have already been framed and queued are past that point. They would
+// arrive after the host reset its own session, numbered for the old one:
+// stale bytes injected into a new session, plus a sequence-gap warning.
+static void test_open_discards_frames_left_over_from_the_previous_session(void) {
+  openPort();
+  for (int i = 0; i < 200; ++i) backend->incoming.push_back(0x5A);
+  tick();
+  TEST_ASSERT_TRUE(sink->count(Rsp::Data) > 0);
+  feedSimple(Cmd::Close);
+
+  sink->clear();
+  sink->discards = 0;
+  feed(buildOpen(115200, kRxBufferSize));
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, sink->discards,
+                                "OPEN must clear the outbound queue");
+  // And STATUS is the first thing the new session sees, not a tail of DATA
+  // frames numbered for the old one.
+  TEST_ASSERT_TRUE(sink->frames.size() > 0);
+  TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(Rsp::Status), sink->frames[0].cmd);
+
+  // A rejected OPEN is not a boundary: nothing changed, so nothing is thrown
+  // away.
+  sink->discards = 0;
+  feed(buildOpen(2000000, kRxBufferSize));  // above the backend's maxBaud
+  TEST_ASSERT_EQUAL_INT(0, sink->discards);
+}
+
 // ---- end to end ------------------------------------------------------------
 
 static void test_full_duplex_bulk_transfer(void) {
@@ -1121,6 +1187,8 @@ int main(int, char**) {
   RUN_TEST(test_future_version_gets_one_error);
   RUN_TEST(test_hello_discards_stale_output);
   RUN_TEST(test_reset_discards_stale_output);
+  RUN_TEST(test_the_tail_of_a_closed_session_is_credited_out);
+  RUN_TEST(test_open_discards_frames_left_over_from_the_previous_session);
   RUN_TEST(test_full_duplex_bulk_transfer);
   RUN_TEST(test_far_end_present_all_along_raises_no_event);
   RUN_TEST(test_detach_faults_the_port_and_is_announced);

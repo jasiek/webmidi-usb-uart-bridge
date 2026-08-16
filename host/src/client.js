@@ -118,10 +118,17 @@ export class BridgeClient extends Emitter {
 
     // OPEN resets both windows and both sequence counters on the device, so
     // the host has to restart from the same place. PROTOCOL.md §5.1.
+    //
+    // Deliberately after the reply rather than before sending the request.
+    // The device may still be delivering the tail of the previous session
+    // right up to the moment it processes this OPEN (§5.9), and SysEx is
+    // ordered, so everything arriving before the STATUS belongs to the old
+    // session. Resetting first would count those frames against the new
+    // sequence and report them as a gap; resetting here discards them, which
+    // is what a session boundary means.
+    const status = await this.#request(frame, Rsp.STATUS);
     this.#resetSession();
     this.credit = this.info.rxBuffer;
-
-    const status = await this.#request(frame, Rsp.STATUS);
     return this.#readStatus(status);
   }
 

@@ -17,7 +17,7 @@ import {
   Rsp,
 } from '../src/constants.js';
 import { FakeDevice } from '../src/fake-device.js';
-import { ParseStatus, parseFrame } from '../src/frame.js';
+import { FrameBuilder, ParseStatus, parseFrame } from '../src/frame.js';
 
 function makeRandom(seed = 0xbadc0de) {
   let state = seed >>> 0;
@@ -383,6 +383,71 @@ test('reattaching clears the fault and the port can be reopened', async () => {
   const payload = Uint8Array.from([0xde, 0xad, 0xbe, 0xef]);
   await client.write(payload);
   assert.deepEqual(await client.readExactly(payload.length, 2000), payload);
+  client.destroy();
+});
+
+// PROTOCOL.md §5.9: a device goes on delivering what it received before the
+// port closed, so a DATA frame from the old session can still be on the wire
+// when OPEN is sent. SysEx is ordered, so everything ahead of the STATUS reply
+// belongs to the old session — the client must not count those bytes against
+// the new one, which is what resetting its session before sending OPEN did.
+test('the previous session tail does not leak past an open', async () => {
+  let deliver = () => {};
+  const info = new FrameBuilder(Rsp.INFO)
+    .u7(1).u7(0).u7(1).u7(0)
+    .u7(BackendId.HARDWARE_UART)
+    .u14(0)
+    .u14(MAX_DATA_RAW)
+    .u14(2048)
+    .u32(921600)
+    .build();
+  const status = () =>
+    new FrameBuilder(Rsp.STATUS)
+      .u7(PortState.OPEN).u7(0).u7(0).u7(0)
+      .u21(0).u21(0).u14(2048).u7(1)
+      .build();
+
+  let staleSeq = null;
+  const transport = {
+    send(msg) {
+      const parsed = parseFrame(msg);
+      if (parsed.status !== ParseStatus.OK) return;
+      if (parsed.cmd === Cmd.HELLO) deliver(info);
+      if (parsed.cmd === Cmd.OPEN) {
+        // The tail of whatever session was running, then the reply to OPEN.
+        if (staleSeq !== null) {
+          deliver(
+            new FrameBuilder(Rsp.DATA)
+              .u7(staleSeq)
+              .packed(Uint8Array.from([0xde, 0xad, 0xbe, 0xef]))
+              .build(),
+          );
+        }
+        deliver(status());
+      }
+    },
+    onSysEx(cb) {
+      deliver = cb;
+    },
+    close() {},
+  };
+
+  const client = new BridgeClient(transport);
+  const warnings = [];
+  client.on('warning', (w) => warnings.push(w));
+
+  await client.open();
+  // One frame of a real session, so the old session's next sequence is not 0
+  // and a mis-attributed tail would be visible as a gap.
+  deliver(new FrameBuilder(Rsp.DATA).u7(0).packed(Uint8Array.from([1, 2, 3])).build());
+  assert.equal(client.available, 3);
+  client.read();
+
+  staleSeq = 1;
+  await client.open();
+
+  assert.deepEqual(warnings, [], `unexpected warnings: ${warnings.join('; ')}`);
+  assert.equal(client.available, 0, 'stale bytes were carried into the new session');
   client.destroy();
 });
 

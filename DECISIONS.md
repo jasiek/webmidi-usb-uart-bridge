@@ -265,3 +265,48 @@ kind of safety that survives someone changing the handshake.
 The mailbox stays synchronous, for the reason that was always the strongest
 one: `open()` has to be able to tell the engine whether the adapter accepted
 the line coding.
+
+### D12. Delivery outlives the port, and `OPEN` is a hard boundary
+
+**Question.** `Bridge::poll()` drains `toHost_` outside the `state_ == Open`
+check, so bytes received before a `CLOSE` or a detach still reach the host.
+Review found the drain half-built: the host's `CREDIT` was answered
+`ERR_NOT_OPEN`, so a 64-byte window let exactly 64 of 300 buffered bytes out
+and stranded 236; and frames already handed to the sink crossed into the next
+session, arriving after the host had reset its own sequence counter. Keep the
+drain and finish it, or delete it?
+
+**Decision.** Keep it, and finish it in three places.
+
+- `CREDIT` is legal with no port open (PROTOCOL.md §4.2). It grants a window;
+  there is nothing about a port for it to break.
+- `OPEN` calls `sink_.discardQueued()` as well as clearing `toHost_`, so the
+  boundary catches frames that have already been framed. `RESET` and `HELLO`
+  already did this.
+- The host client resets its session *after* the `STATUS` reply to `OPEN`
+  rather than before sending the request. SysEx is ordered, so everything
+  ahead of that reply belongs to the old session and is discarded with it.
+
+**Why keep it.** The case it exists for is an adapter unplugged mid-transfer,
+and the bytes at risk are the last ones the far end sent — the tail of a
+firmware upload, the end of a log. PROTOCOL.md §5.8 has promised since phase 2
+that "bytes already received from the far end are still delivered", and
+`test_bytes_received_before_a_detach_still_reach_the_host` has asserted it. The
+alternative was to delete the drain and amend that promise to "delivered if the
+timing works out", which is the kind of qualified guarantee this project exists
+not to make.
+
+**Why it was worth checking rather than assuming.** Every one of the three
+gaps was invisible from the code that had the drain in it. The drain looked
+complete; what defeated it was an allow-list two functions away, a discard that
+happened on one command and not its sibling, and an ordering on the far side of
+the link. That is the shape of a feature that is announced but not delivered —
+and the measurements in the review (64 of 300 bytes; 200 stale bytes and a
+sequence-gap warning after `#resetSession`) are what turned "looks fine" into
+"is not".
+
+**Cost, stated plainly.** A host must accept `DATA` while its port is closed,
+and must keep returning `CREDIT` until it stops arriving. A host that reopens
+without reading the tail loses it — deliberately, because that is what a
+session boundary is for, and losing it at a boundary the host chose is not the
+same as losing it silently mid-stream.

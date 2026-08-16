@@ -111,7 +111,16 @@ export class FakeDevice {
     if (parsed.status !== ParseStatus.OK) return; // not ours
 
     const { cmd, cursor } = parsed;
-    const alwaysLegal = [Cmd.HELLO, Cmd.RESET, Cmd.OPEN, Cmd.PING, Cmd.GET_STATUS];
+    // CREDIT included: the device goes on delivering what it received before
+    // the port closed, and that delivery is credit-paced. PROTOCOL.md §4.2.
+    const alwaysLegal = [
+      Cmd.HELLO,
+      Cmd.RESET,
+      Cmd.OPEN,
+      Cmd.PING,
+      Cmd.GET_STATUS,
+      Cmd.CREDIT,
+    ];
     if (this.state !== PortState.OPEN && !alwaysLegal.includes(cmd)) {
       return this.#error(Err.NOT_OPEN);
     }
@@ -296,7 +305,8 @@ export class FakeDevice {
 
     // Outside the state check, mirroring Bridge::poll: bytes that reached
     // toHost while the port was open are still deliverable after a CLOSE or a
-    // detach. OPEN and RESET are what clear them.
+    // detach, and the host keeps answering with CREDIT to pace them.
+    // PROTOCOL.md §5.9. OPEN and RESET are what clear them.
     this.#drainToHost();
 
     // If the wire throttled us, come back for the rest.

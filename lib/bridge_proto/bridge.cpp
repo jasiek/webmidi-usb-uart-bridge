@@ -50,9 +50,17 @@ void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
 
   const Cmd cmd = static_cast<Cmd>(r.cmd());
 
-  // HELLO and RESET are legal at any time; everything else needs a port.
+  // Legal with no port: the handshake, the two that ask about or change the
+  // port's existence, and CREDIT. CREDIT belongs on the list because the
+  // device goes on delivering what it received before a CLOSE or a detach
+  // (poll(), below), and that delivery is credit-paced like any other — a
+  // closed port that answered ERR_NOT_OPEN would strand everything past the
+  // host's opening window, and the spurious error would reject whatever
+  // unrelated request the host had in flight. It grants a window; it cannot
+  // do anything to a port that is not there. PROTOCOL.md §4.2.
   if (state_ != PortState::Open && cmd != Cmd::Hello && cmd != Cmd::Reset &&
-      cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus) {
+      cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus &&
+      cmd != Cmd::Credit) {
     sendError(Err::NotOpen);
     return;
   }
@@ -135,8 +143,15 @@ void Bridge::handleOpen(FrameReader& r, uint32_t nowMs) {
 
   cfg_ = cfg;
   state_ = PortState::Open;
+  // The tail of the previous session goes here, and it has to go from both
+  // places it can be sitting. resetSession() empties toHost_, but anything
+  // already framed and handed to the sink is past that point — and the
+  // sequence counters restart below, so those frames would arrive in the new
+  // session numbered for the old one and be read as a gap. PROTOCOL.md §5.1
+  // makes OPEN the way back to a known state; this is what that costs.
+  sink_.discardQueued();
   // Re-opening is the idempotent way back to a known state: buffers, windows
-  // and both sequence counters all restart here. PROTOCOL.md §5.1.
+  // and both sequence counters all restart here.
   resetSession(nowMs);
   hostRxBuffer_ = hostRx;
   sendWin_.reset(hostRx);
@@ -476,8 +491,15 @@ void Bridge::poll(uint32_t nowMs) {
   // Outside the state check on purpose. Bytes already in toHost_ were received
   // while the port was open; a detach or a CLOSE arriving a millisecond later
   // does not un-receive them, and stranding them here would be exactly the
-  // silent loss the rest of this design goes out of its way to avoid. OPEN and
-  // RESET clear the buffer explicitly, so nothing crosses a session boundary.
+  // silent loss the rest of this design goes out of its way to avoid.
+  //
+  // Two things have to be true for that to work rather than merely look like
+  // it works. The host's CREDIT has to be accepted with the port closed, or
+  // the drain stops at whatever window was left over (see onSysEx). And OPEN
+  // and RESET have to call sink_.discardQueued() as well as clearing toHost_,
+  // or a frame that left before the boundary arrives after it — carrying the
+  // old session's sequence number into the new one, which the host reads as a
+  // gap and as bytes it never asked for. DECISIONS.md D12.
   BRIDGE_PHASE(14);
   while (sink_.ready() && sendDataChunk()) {
   }

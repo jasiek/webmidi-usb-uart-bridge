@@ -120,8 +120,13 @@ host→device commands are `0x01–0x3F`, device→host are `0x41–0x7F`.
 | 0x4E | `ERROR`   | `u7` code, `u7` detail (§5.5)               |
 | 0x4F | `EVENT`   | `u7` event, `u7` arg (§5.6)                 |
 
-`RESET` and `HELLO` are always legal. Any other host→device command received
-while the port is closed is answered with `ERROR(ERR_NOT_OPEN)`.
+`HELLO`, `OPEN`, `RESET`, `PING`, `GET_STATUS` and `CREDIT` are legal whether
+or not a port is open. Any other host→device command received while the port
+is closed is answered with `ERROR(ERR_NOT_OPEN)`.
+
+`CREDIT` is on that list because a device goes on delivering bytes it received
+before the port closed (§5.9), and that delivery is credit-paced like any
+other. A `CREDIT` with no port open grants a window and does nothing else.
 
 ## 5. Payload formats
 
@@ -268,6 +273,25 @@ attach.
 
 A device that does not set bit 8 never emits either event and always reports
 `present` = 1.
+
+### 5.9 Delivery after the port closes
+
+Bytes the device received from the far end while the port was open are
+delivered even if the port has closed or faulted in the meantime. `CLOSE` and
+`EVT_DETACH` say the far end is no longer reachable; they do not un-receive
+what already arrived, and a serial tunnel that drops the tail of a transfer
+because the cable was pulled a millisecond later is losing data silently.
+
+So after a `CLOSE` or an `EVT_DETACH` a host may still receive `DATA`, and
+must keep answering with `CREDIT` — which is why §4.2 leaves `CREDIT` legal
+with no port open. Sequence numbers continue from where the session left off;
+they restart only at `OPEN` and `RESET`.
+
+`OPEN` and `RESET` are the boundary, and they are hard: both discard whatever
+is still buffered *and* whatever has been framed but not yet transmitted, so
+nothing from the old session can arrive numbered for the new one. A host that
+wants the tail must read it before reopening. A device that has nothing left
+to say emits nothing, so a host that does not care can simply reopen.
 
 ## 6. Flow control
 
