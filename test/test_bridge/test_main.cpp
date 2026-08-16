@@ -29,6 +29,7 @@ class MockBackend : public Backend {
   }
   void close() override { isOpen_ = false; }
   bool isOpen() const override { return isOpen_; }
+  bool present() const override { return presentFlag; }
 
   size_t writable() const override {
     const size_t pending = txCapacity > sent.size() ? txCapacity - sent.size() : 0;
@@ -65,6 +66,7 @@ class MockBackend : public Backend {
 
   // Test knobs.
   bool openSucceeds = true;
+  bool presentFlag = true;  // a far end that can be unplugged, as in phase 2
   size_t txCapacity = 100000;  // effectively unlimited unless a test narrows it
   std::vector<uint8_t> sent;       // bytes the bridge pushed to the far end
   std::deque<uint8_t> incoming;    // bytes the far end will deliver
@@ -812,6 +814,156 @@ static void test_full_duplex_bulk_transfer(void) {
   TEST_ASSERT_EQUAL_HEX8_ARRAY(fromFar.data(), received.data(), kTotal);
 }
 
+// ---- hot-plug (phase 2) ----------------------------------------------------
+
+// True if the device emitted the given event; the event's argument, if any,
+// comes back through argOut.
+static bool sawEvent(Evt evt, uint8_t* argOut = nullptr) {
+  for (const auto& f : sink->frames) {
+    if (f.cmd != static_cast<uint8_t>(Rsp::Event)) continue;
+    FrameReader r;
+    if (FrameReader::parse(f.bytes.data(), f.bytes.size(), r) !=
+        FrameReader::Status::Ok)
+      continue;
+    uint8_t code = 0, arg = 0;
+    if (!r.u7(code) || !r.u7(arg)) continue;
+    if (code != static_cast<uint8_t>(evt)) continue;
+    if (argOut) *argOut = arg;
+    return true;
+  }
+  return false;
+}
+
+static void test_far_end_present_all_along_raises_no_event(void) {
+  openPort();
+  tick();
+  tick();
+  TEST_ASSERT_EQUAL_INT(0, sink->count(Rsp::Event));
+}
+
+static void test_detach_faults_the_port_and_is_announced(void) {
+  openPort();
+  tick();
+  sink->clear();
+
+  backend->presentFlag = false;
+  tick();
+
+  uint8_t arg = 0xFF;
+  TEST_ASSERT_TRUE(sawEvent(Evt::Detach, &arg));
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(BackendId::HardwareUart), arg);
+  TEST_ASSERT_FALSE(backend->isOpen());
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Fault),
+                        static_cast<int>(br->state()));
+
+  // And the port really is shut: data for a device that is gone is refused
+  // rather than buffered for whatever gets plugged in next.
+  sink->clear();
+  const uint8_t payload[] = {0xAA};
+  feedData(0, payload, sizeof(payload));
+  const CapturedFrame* err = sink->first(Rsp::Error);
+  TEST_ASSERT_NOT_NULL(err);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Err::NotOpen), err->bytes[5]);
+}
+
+static void test_detach_is_announced_once_not_every_poll(void) {
+  openPort();
+  backend->presentFlag = false;
+  tick();
+  tick();
+  tick();
+  TEST_ASSERT_EQUAL_INT(1, sink->count(Rsp::Event));
+}
+
+static void test_reattach_clears_the_fault_and_reopens(void) {
+  openPort();
+  backend->presentFlag = false;
+  tick();
+  sink->clear();
+
+  backend->presentFlag = true;
+  tick();
+
+  uint8_t arg = 0xFF;
+  TEST_ASSERT_TRUE(sawEvent(Evt::Attach, &arg));
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(BackendId::HardwareUart), arg);
+  // Attaching does not open a port — it only means there is one to open.
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Closed),
+                        static_cast<int>(br->state()));
+  TEST_ASSERT_FALSE(backend->isOpen());
+
+  openPort();
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Open),
+                        static_cast<int>(br->state()));
+  TEST_ASSERT_TRUE(backend->isOpen());
+}
+
+static void test_presence_event_waits_for_a_free_endpoint(void) {
+  openPort();
+  tick();
+  sink->clear();
+
+  // USB busy at the moment the cable is pulled.
+  sink->isReady = false;
+  backend->presentFlag = false;
+  tick();
+  TEST_ASSERT_EQUAL_INT(0, sink->count(Rsp::Event));
+  // The port still faults immediately — only the announcement is deferred.
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Fault),
+                        static_cast<int>(br->state()));
+
+  sink->isReady = true;
+  tick();
+  TEST_ASSERT_TRUE(sawEvent(Evt::Detach));
+}
+
+// Reads STATUS's trailing `present` field, skipping the seven that precede it.
+static uint8_t statusPresent(const CapturedFrame* f) {
+  FrameReader r;
+  TEST_ASSERT_EQUAL(FrameReader::Status::Ok,
+                    FrameReader::parse(f->bytes.data(), f->bytes.size(), r));
+  uint8_t u = 0;
+  uint16_t w = 0;
+  uint32_t d = 0;
+  TEST_ASSERT_TRUE(r.u7(u));   // state
+  TEST_ASSERT_TRUE(r.u7(u));   // out_lines
+  TEST_ASSERT_TRUE(r.u7(u));   // in_lines
+  TEST_ASSERT_TRUE(r.u7(u));   // errflags
+  TEST_ASSERT_TRUE(r.u21(d));  // rx_count
+  TEST_ASSERT_TRUE(r.u21(d));  // tx_count
+  TEST_ASSERT_TRUE(r.u14(w));  // credit
+  uint8_t present = 0xFF;
+  TEST_ASSERT_TRUE(r.u7(present));
+  return present;
+}
+
+static void test_status_reports_whether_a_far_end_is_attached(void) {
+  openPort();
+  feedSimple(Cmd::GetStatus);
+  TEST_ASSERT_EQUAL_UINT8(1, statusPresent(sink->last(Rsp::Status)));
+
+  // Answered from the backend, not from what poll() has got around to
+  // noticing — so this holds with no tick() in between.
+  backend->presentFlag = false;
+  sink->clear();
+  feedSimple(Cmd::GetStatus);
+  TEST_ASSERT_EQUAL_UINT8(0, statusPresent(sink->last(Rsp::Status)));
+}
+
+static void test_bytes_received_before_a_detach_still_reach_the_host(void) {
+  openPort();
+  const uint8_t fromFar[] = {0x01, 0x7F, 0x80, 0xFF};
+  for (uint8_t b : fromFar) backend->incoming.push_back(b);
+
+  // Unplugged in the same instant, before any poll has drained the backend.
+  backend->presentFlag = false;
+  tick();
+
+  const std::vector<uint8_t> got = collectData();
+  TEST_ASSERT_EQUAL_size_t(sizeof(fromFar), got.size());
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(fromFar, got.data(), sizeof(fromFar));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_hello_returns_info);
@@ -844,5 +996,12 @@ int main(int, char**) {
   RUN_TEST(test_hello_discards_stale_output);
   RUN_TEST(test_reset_discards_stale_output);
   RUN_TEST(test_full_duplex_bulk_transfer);
+  RUN_TEST(test_far_end_present_all_along_raises_no_event);
+  RUN_TEST(test_detach_faults_the_port_and_is_announced);
+  RUN_TEST(test_detach_is_announced_once_not_every_poll);
+  RUN_TEST(test_reattach_clears_the_fault_and_reopens);
+  RUN_TEST(test_presence_event_waits_for_a_free_endpoint);
+  RUN_TEST(test_status_reports_whether_a_far_end_is_attached);
+  RUN_TEST(test_bytes_received_before_a_detach_still_reach_the_host);
   return UNITY_END();
 }

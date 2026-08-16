@@ -192,6 +192,12 @@ populated.
 | `rx_count`  | `u21` | bytes received from the far end since `OPEN`  |
 | `tx_count`  | `u21` | bytes sent to the far end since `OPEN`        |
 | `credit`    | `u14` | credit the device currently has for host→device data |
+| `present`   | `u7`  | 1 if a far end is attached, 0 if not (§5.8)   |
+
+`present` was added after the first release. A host that finds the payload ends
+before it must treat the far end as attached: that is the correct answer for
+every backend that cannot be unplugged, which is the only kind that existed
+when the field did not.
 
 ### 5.5 Error codes
 
@@ -231,6 +237,26 @@ populated.
 | 6   | RI readable                      |
 | 7   | hardware RTS/CTS flow control    |
 | 8   | hot-plug (`EVT_ATTACH`/`DETACH`) |
+
+### 5.8 Hot-plug
+
+A backend whose far end can be physically removed — the PIO-USB CDC host, and
+nothing else so far — sets capability bit 8. Such a device:
+
+- emits `EVT_ATTACH` when a far end appears and `EVT_DETACH` when one goes
+  away, each carrying the backend id as its argument;
+- reports the current answer in `STATUS.present`, so a host that connects
+  while a device is already attached does not have to infer it from silence;
+- on detach, closes the port, discards anything still queued toward the far
+  end, and moves to `state` = fault. Bytes already received from the far end
+  are still delivered — a detach does not un-receive them.
+
+Attaching does **not** open a port. It means there is one to open: the host
+must send `OPEN` as it would have on connecting, which is also what re-arms
+the port after the fault a detach leaves behind.
+
+A device that does not set bit 8 never emits either event and always reports
+`present` = 1.
 
 ## 6. Flow control
 

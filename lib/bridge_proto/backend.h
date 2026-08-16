@@ -24,6 +24,14 @@ class Backend {
   virtual void close() = 0;
   virtual bool isOpen() const = 0;
 
+  // Whether a far end physically exists right now, independent of whether a
+  // port is open on it. A soldered-down UART has no way to tell and no reason
+  // to care, so the default is "always there"; the PIO-USB host backend
+  // reports device attach and detach through it, and the engine turns the
+  // transitions into EVT_ATTACH / EVT_DETACH. Only meaningful when caps()
+  // advertises kCapHotplug.
+  virtual bool present() const { return true; }
+
   // Bytes that write() would accept right now.
   virtual size_t writable() const = 0;
   // Returns how many bytes were accepted; may be less than n.

@@ -72,6 +72,7 @@ class Bridge {
   void pumpToBackend();
   void pumpFromBackend();
   void pumpLines();
+  void pumpPresence();
 
   void resetSession(uint32_t nowMs);
 
@@ -97,6 +98,9 @@ class Bridge {
   uint16_t hostMaxRaw_ = kMaxDataRaw;
 
   uint8_t lastInputLines_ = 0;
+  bool lastPresent_ = true;
+  // 0 = nothing to announce; otherwise the Evt awaiting a free USB endpoint.
+  uint8_t presenceEvt_ = 0;
   uint8_t errFlags_ = 0;
   uint32_t rxCount_ = 0;
   uint32_t txCount_ = 0;

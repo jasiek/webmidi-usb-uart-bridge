@@ -6,6 +6,10 @@ void Bridge::begin(uint32_t nowMs) {
   nowMs_ = nowMs;
   resetSession(nowMs);
   state_ = PortState::Closed;
+  // Sampled rather than assumed, so a device already attached at boot is not
+  // announced as an attach to a host that was not there to miss it.
+  lastPresent_ = backend_.present();
+  presenceEvt_ = 0;
 }
 
 void Bridge::resetSession(uint32_t nowMs) {
@@ -252,6 +256,12 @@ void Bridge::sendStatus() {
   w.u21(rxCount_);
   w.u21(txCount_);
   w.u14(sendWin_.credit());
+  // Trailing, so a host built against the original layout stops before it and
+  // is none the wiser. PROTOCOL.md §5.4.
+  // Asked of the backend rather than read from lastPresent_: a STATUS that
+  // arrives between an attach and the poll() that notices it should say what
+  // is true now, not what we have got around to announcing.
+  w.u7(backend_.present() ? 1 : 0);
   const size_t n = w.end();
   if (n) sink_.send(frameBuf_, n);
 }
@@ -361,23 +371,69 @@ void Bridge::pumpLines() {
   }
 }
 
+// Attach and detach are the one thing a host cannot discover by asking: until
+// something is attached there is nothing to open, and GET_STATUS on a closed
+// port looks the same either way. So the transition is tracked as level rather
+// than edge — if the USB endpoint is busy at the moment it happens, the
+// announcement waits for a free one instead of being dropped.
+void Bridge::pumpPresence() {
+  const bool present = backend_.present();
+  if (present != lastPresent_) {
+    lastPresent_ = present;
+    if (present) {
+      // A previous detach left us in Fault. The far end is new, so the fault
+      // is over — but the port is not open until the host says so.
+      if (state_ == PortState::Fault) state_ = PortState::Closed;
+      presenceEvt_ = static_cast<uint8_t>(Evt::Attach);
+    } else {
+      if (state_ == PortState::Open) {
+        // Last chance to collect what the far end already sent. Once close()
+        // has run, a backend is entitled to forget it.
+        pumpFromBackend();
+        backend_.close();
+        state_ = PortState::Fault;
+        // Bytes still queued for a port that no longer exists are not going to
+        // arrive; holding them would deliver them to whatever is plugged in
+        // next. What came *from* the device is still ours to deliver, so
+        // toHost_ is left alone.
+        toBackend_.clear();
+      }
+      presenceEvt_ = static_cast<uint8_t>(Evt::Detach);
+    }
+  }
+
+  if (presenceEvt_ != 0 && sink_.ready()) {
+    sendEvent(static_cast<Evt>(presenceEvt_), static_cast<uint8_t>(backend_.id()));
+    presenceEvt_ = 0;
+  }
+}
+
 void Bridge::poll(uint32_t nowMs) {
   nowMs_ = nowMs;
-  if (state_ != PortState::Open) return;
 
-  BRIDGE_PHASE(10);
-  pumpToBackend();
-  BRIDGE_PHASE(11);
-  pumpFromBackend();
-  BRIDGE_PHASE(12);
-  pumpLines();
+  // Before the state check, deliberately: a detach is most of what a host in
+  // Fault or Closed is waiting to hear about.
+  BRIDGE_PHASE(16);
+  pumpPresence();
 
-  BRIDGE_PHASE(13);
-  if (sink_.ready() && recvWin_.shouldGrant(nowMs))
-    sendCredit(recvWin_.takeGrant(nowMs));
+  if (state_ == PortState::Open) {
+    BRIDGE_PHASE(10);
+    pumpToBackend();
+    BRIDGE_PHASE(11);
+    pumpFromBackend();
+    BRIDGE_PHASE(12);
+    pumpLines();
 
-  // Drain toward the host for as long as USB and the window both allow. The
-  // ready() check keeps a full USB endpoint from costing us buffered bytes.
+    BRIDGE_PHASE(13);
+    if (sink_.ready() && recvWin_.shouldGrant(nowMs))
+      sendCredit(recvWin_.takeGrant(nowMs));
+  }
+
+  // Outside the state check on purpose. Bytes already in toHost_ were received
+  // while the port was open; a detach or a CLOSE arriving a millisecond later
+  // does not un-receive them, and stranding them here would be exactly the
+  // silent loss the rest of this design goes out of its way to avoid. OPEN and
+  // RESET clear the buffer explicitly, so nothing crosses a session boundary.
   BRIDGE_PHASE(14);
   while (sink_.ready() && sendDataChunk()) {
   }
