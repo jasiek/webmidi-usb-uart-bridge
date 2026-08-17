@@ -1,7 +1,7 @@
 // Phase 2 backend: a USB CDC/ACM serial adapter attached to a bit-banged USB
 // host port (Pico-PIO-USB) on GPIO16/GPIO17.
 //
-// See DECISIONS.md D1 for the phasing and D7 for why the host stack lives on
+// See DECISIONS.md D1 for the phasing and D8 for why the host stack lives on
 // core1, hardware/README.md for the port's electrical requirements.
 //
 // ---- the two-core split ----------------------------------------------------

@@ -1135,7 +1135,7 @@ static void test_a_flapping_connector_leaves_the_newest_two_events(void) {
   // Closed rather than Fault, and that is the right answer: the port faulted
   // on the first detach, the attach cleared it, and the second detach found
   // nothing open to take away. Fault is what happened to a port the host
-  // asked for — DECISIONS.md D8.
+  // asked for — DECISIONS.md D9.
   TEST_ASSERT_EQUAL_INT(static_cast<int>(PortState::Closed),
                         static_cast<int>(br->state()));
   feedSimple(Cmd::GetStatus);

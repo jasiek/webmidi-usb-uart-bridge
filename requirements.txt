@@ -1,0 +1,5 @@
+# PlatformIO, installed by ./bootstrap.sh into .venv/ against the Python pinned
+# in .tool-versions. Everything below PlatformIO — the RP2040 toolchain, the
+# arduino-pico core, the libraries — is pinned by PlatformIO itself from
+# platformio.ini, not from here.
+platformio==6.1.19

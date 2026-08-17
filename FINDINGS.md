@@ -11,8 +11,42 @@ next person does not rediscover them.
   `https://github.com/maxgerhardt/platform-raspberrypi.git`. Installing the
   platform by name gets you a core that cannot do any of what this project
   needs.
-- On this machine `pio` is not on `PATH`; it lives at
+- `board_build.core = earlephilhower` does not rescue that: the registry
+  platform ignores the key silently, installs `framework-arduino-mbed` anyway,
+  and the build dies on `<Adafruit_TinyUSB.h>` and then on `<Arduino.h>`. A
+  machine where someone had once installed the fork by hand built fine, which
+  is what hid it — `platform` has to name the fork, pinned to a tag, and now
+  does.
+- `pio` is not on `PATH` by default. `./bootstrap.sh` puts it at `.venv/bin/pio`,
+  installed from the version pinned in `requirements.txt`; before that script
+  existed it was wherever the installer had left it, typically
   `~/.platformio/penv/bin/pio`.
+- asdf shims are stubs that re-exec `asdf` itself, so putting only
+  `~/.asdf/shims` on `PATH` yields `exec: asdf: not found` from every shimmed
+  binary. Both `~/.asdf/bin` and `~/.asdf/shims` have to be there — including in
+  `$GITHUB_PATH`, where the failure surfaces one step later than the mistake.
+- A bash `EXIT` trap sets the script's exit status from the last command it
+  runs, so a trap ending in a falsy test (`[ -n "$tmp" ] && rm -rf "$tmp"`)
+  turns every clean exit into exit 1. `bootstrap.sh` ends its cleanup with an
+  explicit `return 0`.
+- `asdf install python` builds CPython from source, which needs the openssl,
+  zlib and libffi headers present *before* it starts. `bootstrap.sh` probes for
+  them with the compiler and names the missing packages, because python-build's
+  own failure is 200 lines of make output that does not.
+
+## MIDI on a headless machine
+
+- There is no `/dev/snd` on a stock Linux CI runner, so RtMidi's ALSA backend
+  cannot create a sequencer client and `new midi.Input()` throws "Failed to
+  initialise RtMidi" — before any port is opened. Anything that enumerates or
+  opens MIDI ports (`npm run list`, `probe`, `loopback` against hardware) is
+  therefore not runnable in CI on Linux; `npm test` and `npm run loopback --
+  --fake` are, because neither touches RtMidi. That is a second reason for
+  `host/src/fake-device.js` beyond the one in the loopback notes.
+- `@julusian/midi` is an N-API addon (`napi_versions: [7]`), so its prebuilt
+  binaries are keyed to the ABI version rather than to a Node release. Moving
+  the pinned Node version does not force a compile, and a machine with no ALSA
+  headers can still install it.
 
 ## Testing
 
@@ -113,7 +147,7 @@ next person does not rediscover them.
   it races nothing; `clear()` resets both indices and is only safe when the
   other core is quiet. Relying on "core0 is blocked in the handshake, so it is
   quiet" does not work here, because the handshake gives up after a second and
-  the op it abandoned still runs later — see DECISIONS.md D11.
+  the op it abandoned still runs later — see DECISIONS.md D12.
 - `Adafruit_USBH_Host::task()` defaults to `timeout_ms = UINT32_MAX`, which
   blocks in the event queue until the USB stack has something to say. In a
   `loop1()` that also has to move bytes, that default means the byte-moving

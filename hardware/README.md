@@ -41,7 +41,7 @@ line driving GPIO1. Connecting a 5 V TX line directly will damage the pin.
 
 Implemented in firmware as `pio run -e pico_cdc`; **not yet run against a real
 port**, because building one needs the parts below. See DECISIONS.md D1 for the
-phasing and D7 for how the firmware is structured around it.
+phasing and D8 for how the firmware is structured around it.
 
 The pin pair is a build setting, not a hard-coded constant: `-DBRIDGE_PIO_USB_DP=16`
 picks D+, and D− is always the next GPIO up.

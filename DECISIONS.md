@@ -135,9 +135,57 @@ The watchdog also turned out to be the diagnostic that mattered: it is what
 made the failure *visible* as `boot=WATCHDOG` rather than as an unexplained
 silence, and its scratch registers are what survived to name the hung phase.
 
+## 2026-08-16 — Toolchain
+
+### D7. One pinned toolchain, installed by `bootstrap.sh` via asdf
+
+**Question.** The project needs four things before anything can be built:
+PlatformIO, an RP2040 core, Node for the host client, and a Python for
+PlatformIO to run on. None of them was pinned, and `pio` lived wherever each
+machine's installer had left it. What installs them, and what fixes the
+versions?
+
+**Decision.** `./bootstrap.sh`, driven by three pinned files:
+
+| File               | Pins                                     |
+| ------------------ | ---------------------------------------- |
+| `.tool-versions`   | nodejs and python, installed by asdf     |
+| `requirements.txt` | PlatformIO, installed into `.venv/`      |
+| `platformio.ini`   | the RP2040 platform fork, by git tag     |
+
+The script installs asdf itself if it is absent — a pinned release, checked
+against a sha256 embedded in the script — then the runtimes, then PlatformIO,
+then the host's npm dependencies from the lockfile. It is idempotent, prints
+what it skipped, and exits non-zero on the first thing it cannot do.
+
+**Why asdf rather than the system package manager.** The versions have to be
+identical on macOS, on Linux and on a CI runner, and no package manager spans
+those three. `.tool-versions` is a file both asdf and mise read, and it is
+already the convention for exactly this.
+
+**Why PlatformIO lives in `.venv/` rather than in `.tool-versions`.** asdf has
+no PlatformIO plugin, and PlatformIO's own installer puts it in a global
+`~/.platformio/penv` shared by every project on the machine. A project-local
+virtualenv pins the version per checkout and is deleted by deleting a
+directory.
+
+**Why the RP2040 platform is now a git URL with a tag.** `platform = raspberrypi`
+resolves to the registry platform, which carries only the Arduino-mbed core and
+ignores `board_build.core = earlephilhower` without a word. FINDINGS.md recorded
+that months ago; `platformio.ini` did not act on it, so the firmware built only
+on machines where someone had once installed the fork by hand. On a clean
+checkout it failed on `<Arduino.h>`. Pinning the fork by tag is what makes
+"clone, bootstrap, build" true rather than nearly true.
+
+**Escape hatches, because a bootstrap that can only do one thing gets replaced.**
+`--no-asdf` uses the `node` and `python3` already on `PATH` and refuses them if
+they are not the pinned major version, which is what to use with
+`actions/setup-node`; `--check` verifies an install and changes nothing, which
+is what a CI job runs to fail fast with a legible message.
+
 ## 2026-08-16 — Phase 2: the CDC/ACM host backend
 
-### D7. The USB host stack gets core1, and talks to core0 through rings
+### D8. The USB host stack gets core1, and talks to core0 through rings
 
 **Question.** Pico-PIO-USB and the protocol engine both need servicing
 promptly. Where does `tuh_task()` run?
@@ -173,7 +221,7 @@ feeding its watchdog and keeps answering MIDI — so the failure surfaces as
 backend would need release/acquire ordering on its indices. It was right; that
 is `SpscRing`, and the single-core `RingBuf` is left alone.
 
-### D8. A detach faults the port; it does not quietly close it
+### D9. A detach faults the port; it does not quietly close it
 
 **Question.** The adapter is unplugged mid-session. What should the host see?
 
@@ -193,7 +241,7 @@ Not auto-reopening is the same argument. The new device is a different device.
 It may be a different *kind* of device. Re-applying the old port settings to it
 without being asked is a guess, and `OPEN` is cheap.
 
-### D9. `STATUS` gains a `present` field rather than relying on events alone
+### D10. `STATUS` gains a `present` field rather than relying on events alone
 
 **Question.** A host connects to a device that already has an adapter
 attached. `EVT_ATTACH` was emitted before it was listening. How does it find
@@ -213,7 +261,7 @@ Appending it is backward compatible: a host that stops reading after `credit`
 never sees it, and its assumption that the far end is present is the right
 answer for every backend that cannot be unplugged.
 
-### D10. `INFO.caps` on this backend claims DTR, RTS and hot-plug — and nothing else
+### D11. `INFO.caps` on this backend claims DTR, RTS and hot-plug — and nothing else
 
 **Question.** CDC/ACM is a richer interface than a bare UART. How much of it
 can we actually offer?
@@ -234,9 +282,9 @@ event that can never arrive.
 
 ## 2026-08-16 — Phase 2 review
 
-### D11. A ring is emptied by the core that consumes it, never by the other one
+### D12. A ring is emptied by the core that consumes it, never by the other one
 
-**Question.** D7 argued that the synchronous mailbox is what makes `OPEN` and
+**Question.** D8 argued that the synchronous mailbox is what makes `OPEN` and
 `FLUSH` able to empty the cross-core rings: core0 is blocked in `runOp()` while
 core1 runs the op, so core1 can call `SpscRing::clear()` without racing
 anyone. Does that hold?
@@ -247,8 +295,8 @@ owns the ring's *consumer* end, calling `discard(size())`, which touches only
 that core's own tail index. `clear()` stays in `spsc_ring.h` for the
 initialisation case and is not called across cores at all.
 
-**Why.** The invariant D7 relied on has a hole in it, and the hole is the
-timeout D7 itself introduced. Core0 gives up after a second precisely because
+**Why.** The invariant D8 relied on has a hole in it, and the hole is the
+timeout D8 itself introduced. Core0 gives up after a second precisely because
 core1 can be stuck for ever inside a TinyUSB control transfer (FINDINGS.md).
 When it does give up, core1 still owns the op and will still run it whenever it
 comes back — and by then core0 is running again. `clear()` resets both indices,
@@ -266,7 +314,7 @@ The mailbox stays synchronous, for the reason that was always the strongest
 one: `open()` has to be able to tell the engine whether the adapter accepted
 the line coding.
 
-### D12. Delivery outlives the port, and `OPEN` is a hard boundary
+### D13. Delivery outlives the port, and `OPEN` is a hard boundary
 
 **Question.** `Bridge::poll()` drains `toHost_` outside the `state_ == Open`
 check, so bytes received before a `CLOSE` or a detach still reach the host.
@@ -310,3 +358,4 @@ and must keep returning `CREDIT` until it stops arriving. A host that reopens
 without reading the tail loses it — deliberately, because that is what a
 session boundary is for, and losing it at a boundary the host chose is not the
 same as losing it silently mid-stream.
+

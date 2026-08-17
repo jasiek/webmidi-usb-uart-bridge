@@ -27,10 +27,46 @@ through a `Backend` interface and emits through a `FrameSink`. That is what
 lets the flow control, sequencing and error paths be tested on a laptop with
 nothing plugged in — which is most of where the bugs would otherwise be.
 
+## Getting set up
+
+```sh
+./bootstrap.sh
+export PATH="$PWD/.venv/bin:$HOME/.asdf/bin:$HOME/.asdf/shims:$PATH"
+```
+
+That installs [asdf](https://asdf-vm.com) if it is missing, the Node and Python
+versions pinned in `.tool-versions`, PlatformIO (pinned in `requirements.txt`)
+into `.venv/`, the RP2040 platform and toolchain (pinned by tag in
+`platformio.ini`), and the host client's npm dependencies. Every version this
+project depends on is fixed in one of those four files.
+
+It is idempotent — a second run takes about a second — works on Linux and
+macOS, and is non-interactive, so it doubles as a CI step:
+
+```yaml
+- run: ./bootstrap.sh    # also appends .venv/bin and the asdf dirs to $GITHUB_PATH
+- run: pio test -e native
+- run: pio run -e pico
+- run: cd host && npm test
+```
+
+A cold run takes several minutes, most of it building CPython from source and
+fetching the RP2040 toolchain; cache `~/.asdf` and `~/.platformio` between CI
+runs. Note that `npm run list`, `probe` and hardware `loopback` cannot run on a
+Linux CI runner at all — there is no `/dev/snd`, so RtMidi cannot initialise
+(FINDINGS.md). `npm test` and `npm run loopback -- --fake` do not touch it.
+
+Three escape hatches:
+
+| Flag             | What it does                                                     |
+| ---------------- | ---------------------------------------------------------------- |
+| `--no-asdf`      | Use the `node`/`python3` on `PATH`, refusing a wrong major version. For CI that prefers `actions/setup-node`. |
+| `--no-firmware`  | Skip the RP2040 toolchain download, for host-only work.           |
+| `--check`        | Verify an install, change nothing, exit non-zero if anything is missing. |
+
 ## Building and testing
 
-PlatformIO is the build system. On this machine it lives at
-`~/.platformio/penv/bin/pio` rather than on `PATH`.
+PlatformIO is the build system, installed by `bootstrap.sh` into `.venv/bin/pio`.
 
 ```sh
 # Firmware — phase 1, hardware UART on GPIO0/1
@@ -122,10 +158,10 @@ caveat there about what a loopback can and cannot prove.
 - **Phase 2 — Pico-PIO-USB CDC/ACM host: written, builds, not yet run on
   hardware.** `pio run -e pico_cdc`. The USB host stack runs on core1 and
   reaches the protocol engine on core0 through lock-free rings and a timed
-  mailbox (DECISIONS.md D7). ACM, FTDI, CP210x, CH34x and PL2303 adapters are
+  mailbox (DECISIONS.md D8). ACM, FTDI, CP210x, CH34x and PL2303 adapters are
   all covered by TinyUSB's host CDC driver. Hot-plug is reported as
   `EVT_ATTACH`/`EVT_DETACH` and in `STATUS.present`; a detach faults the port
-  rather than closing it quietly (D8). The engine's half of that is under test
+  rather than closing it quietly (D9). The engine's half of that is under test
   in `test/test_bridge` and `host/test/client.test.js`; **the USB host port
   itself has never been powered up** — building it needs the resistors and
   pull-downs in `hardware/README.md`.

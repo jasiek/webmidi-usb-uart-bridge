@@ -499,7 +499,7 @@ void Bridge::poll(uint32_t nowMs) {
   // and RESET have to call sink_.discardQueued() as well as clearing toHost_,
   // or a frame that left before the boundary arrives after it — carrying the
   // old session's sequence number into the new one, which the host reads as a
-  // gap and as bytes it never asked for. DECISIONS.md D12.
+  // gap and as bytes it never asked for. DECISIONS.md D13.
   BRIDGE_PHASE(14);
   while (sink_.ready() && sendDataChunk()) {
   }
