@@ -205,6 +205,22 @@ next person does not rediscover them.
   including it from a `.cpp` fails on both. `src/pio_usb_probe.c` is a C file
   for that reason alone; re-declaring `root_port_t` in C++ instead would
   compile and would silently break the day the library reorders a field.
+- **First working enumeration on the bench port was a low-speed device, and
+  the full-speed one on the same wiring still fails.** A Logitech mouse came up
+  as `enum=1(046d:c077) fullspeed=0`, which proves the whole lower half at
+  once: VBUS, ground, the pull-downs, the 22 O series pair, the PIO state
+  machines, the frame interrupt on core1, TinyUSB's enumeration and our
+  callbacks. `attached=0` alongside it is correct and is the counter earning
+  its keep — a mouse enumerates but is not a serial port, so the engine never
+  sees a far end.
+
+  A USB-serial adapter on the same 5 cm of wire reaches `conn=1 fullspeed=1
+  susp=0` — detected, and bus-reset by TinyUSB — and then never completes
+  enumeration, with `ep_err=0`. Low speed is 1.5 Mbit/s and full speed is
+  12 Mbit/s, so a port that does one and not the other is not a wiring
+  topology fault; it is either signal integrity at the higher rate or the
+  device browning out. Worth remembering that a successful enumeration proves
+  much less than it looks like it proves if it was a low-speed one.
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs
