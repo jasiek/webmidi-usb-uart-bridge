@@ -265,9 +265,31 @@ next person does not rediscover them.
   a reboot. Surviving the hang was the design goal and is not the same as
   recovering from it; nothing reclaims a mailbox from a core that is never
   coming back.
-- Bytes go missing before that, too: 4096 sent, 4088 back at 38400 and ~3500 at
-  9600 and 19200, with `to_dev=12288 from_dev=11094` on the counters. Not yet
-  diagnosed.
+- **The wedge and the byte loss are two different bugs**, which one run made
+  look like one. Instrumenting core1 with a heartbeat separated them: the
+  stall shows `host_tasks` frozen, and the byte loss shows `host_tasks`
+  climbing happily with `from_dev` stuck. They have to be chased separately.
+- **The stall is in TinyUSB's enumeration, not in our mailbox.** The clearest
+  instance had `enum=0` and `op_timeouts=0` — core1 died before an op was ever
+  posted, so the timed mailbox was never involved. `tuh_control_xfer()` spins
+  `while (result == XFER_RESULT_INVALID) tuh_task_ext(0, false);` with a
+  `// TODO probably some timeout` above it, and enumeration uses it. It is
+  intermittent: the same FTDI on the same wiring enumerates cleanly on one
+  boot and hangs the core on the next.
+- Core0 can see it, and could not before. `hostAlive()` samples a beat core1
+  bumps every turn; a changed beat restarts the clock, an unchanged one is
+  evidence only after 2 s. `claimOp()` now fails immediately when core1 is
+  gone rather than stalling the engine for a second per op — which turned a
+  five-baud sweep from five seconds of dead air into an immediate honest
+  failure. `hostPhase()` records which stage core1 was in when it stopped.
+- **The byte loss is not a hang and not the credit window.** 4096 bytes
+  written, `to_dev=4096`, and `from_dev` stops short — 3420, 3506, 3499 across
+  runs, consistently ~600 short at 9600 and 19200 but only 8 short at 38400,
+  which is the wrong way round for anything driven by throughput pressure.
+  Core1 keeps polling and the adapter simply stops returning bytes. Undiagnosed;
+  the FT232R's flow control and its FIFO behaviour on a TX/RX loop are the
+  next things to look at, and `lines=0x03` means DTR and RTS are both asserted
+  while CTS is floating.
 
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core

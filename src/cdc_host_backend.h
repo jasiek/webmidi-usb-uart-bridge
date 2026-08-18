@@ -134,6 +134,35 @@ class CdcHostBackend : public Backend {
   uint32_t bytesFromDevice() const { return bytesFromDevice_; }
   uint32_t opTimeouts() const { return opTimeouts_; }
   bool clockOk() const { return clockOk_; }
+
+  // Whether core1 is still going round its loop. Core1 can stop for good —
+  // TinyUSB's blocking control transfers have no timeout and its enumeration
+  // uses them, so a far end that stops answering mid-enumeration takes the
+  // host stack with it. Observed on hardware: `host_tasks` stops advancing
+  // with op_timeouts still 0, i.e. before our mailbox is ever involved.
+  //
+  // Core0 has to be able to tell that apart from an empty port, because they
+  // look identical from the engine's side — nothing attached, nothing
+  // happening — and they need opposite responses from whoever is watching.
+  // Not const: it samples, so it keeps the last reading it took. Core0 only.
+  bool hostAlive(uint32_t nowMs);
+
+  // Where core1 was when it last checked in. When it stops, the beat above
+  // says so and this says where — the same trick the phase 1 wedge was found
+  // with, minus the watchdog scratch registers, because core0 is still alive
+  // to read it directly. See kPhase* below.
+  uint8_t hostPhase() const { return core1Phase_.load(std::memory_order_relaxed); }
+  static const char* hostPhaseName(uint8_t phase);
+
+  // Core1 loop stages, in the order loop1() runs them.
+  static constexpr uint8_t kPhaseTask = 1;     // inside USBHost.task()
+  static constexpr uint8_t kPhaseOp = 2;       // executeOp()
+  static constexpr uint8_t kPhasePump = 3;     // pumpDevice()
+  static constexpr uint8_t kPhaseIdle = 4;     // between turns
+
+  void setHostPhase(uint8_t phase) {
+    core1Phase_.store(phase, std::memory_order_relaxed);
+  }
   uint32_t deviceMounts() const { return deviceMounts_; }
   // The raw bus levels, for when nothing enumerates and the question is
   // whether anything is electrically there. An idle port with nothing plugged
@@ -213,9 +242,22 @@ class CdcHostBackend : public Backend {
   uint32_t deviceMounts_ = 0;
   uint16_t lastVid_ = 0;
   uint16_t lastPid_ = 0;
+  // Bumped by core1 every time round loop1(). Core0 watches it for movement
+  // rather than for any particular value.
+  std::atomic<uint32_t> beat_{0};
+  std::atomic<uint8_t> core1Phase_{0};
+
   // Written by core0 only.
   uint32_t opTimeouts_ = 0;
   bool clockOk_ = false;
+  uint32_t lastBeat_ = 0;
+  uint32_t lastBeatAt_ = 0;
+  bool beatSeen_ = false;
+
+  // Long enough that a slow enumeration is not mistaken for a dead core —
+  // core1's loop runs a quarter of a million times a second when it is well,
+  // so a whole second of silence is already far outside normal.
+  static constexpr uint32_t kHostStallMs = 2000;
 };
 
 // The one instance, so the TinyUSB C callbacks have something to reach.

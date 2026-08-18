@@ -143,7 +143,29 @@ uint8_t CdcHostBackend::takeErrorFlags() {
 
 // ---- the mailbox -----------------------------------------------------------
 
+// Sampled rather than timed, so it stays correct however irregularly core0
+// gets round to asking. A changed beat is proof of life and restarts the
+// clock; an unchanged one is only evidence once enough time has passed.
+bool CdcHostBackend::hostAlive(uint32_t nowMs) {
+  const uint32_t beat = beat_.load(std::memory_order_acquire);
+  if (!beatSeen_ || beat != lastBeat_) {
+    beatSeen_ = true;
+    lastBeat_ = beat;
+    lastBeatAt_ = nowMs;
+    return true;
+  }
+  return (nowMs - lastBeatAt_) < kHostStallMs;
+}
+
 bool CdcHostBackend::claimOp() {
+  // A dead core1 will never answer, and waiting kOpTimeoutMs to discover that
+  // on every call turns each op into a second of stalled protocol engine. The
+  // op has failed either way; failing now says so a second sooner.
+  if (!hostAlive(millis())) {
+    ++opTimeouts_;
+    return false;
+  }
+
   // A previous op that timed out is still owned by core1, and its arguments
   // are still being read. Taking the slot is therefore the first thing a
   // caller does, before it writes anything: checking afterwards would be
@@ -338,10 +360,28 @@ void CdcHostBackend::pumpDevice() {
   }
 }
 
+// Core0 watches this for movement, not for a value: any change means core1
+// came back round its loop since the last look.
 void CdcHostBackend::serviceHost() {
   ++hostTasks_;
+  beat_.store(hostTasks_, std::memory_order_release);
+  setHostPhase(kPhaseOp);
   executeOp();
-  if (open_.load(std::memory_order_acquire)) pumpDevice();
+  if (open_.load(std::memory_order_acquire)) {
+    setHostPhase(kPhasePump);
+    pumpDevice();
+  }
+  setHostPhase(kPhaseIdle);
+}
+
+const char* CdcHostBackend::hostPhaseName(uint8_t phase) {
+  switch (phase) {
+    case kPhaseTask: return "usb_task";
+    case kPhaseOp:   return "execute_op";
+    case kPhasePump: return "pump_device";
+    case kPhaseIdle: return "idle";
+    default:         return "none";
+  }
 }
 
 void CdcHostBackend::setPresent(bool present) {
