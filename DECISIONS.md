@@ -359,3 +359,41 @@ without reading the tail loses it — deliberately, because that is what a
 session boundary is for, and losing it at a boundary the host chose is not the
 same as losing it silently mid-stream.
 
+
+### D14. One TinyUSB version, pinned on the base environment
+
+**Question.** `pico` built against the 3.4.4 bundled with the arduino-pico
+core and `pico_cdc` against 3.7.7 from the registry, because naming
+Pico-PIO-USB in `lib_deps` makes the dependency finder resolve TinyUSB from the
+registry too. Two USB stacks in one project. Unify them, or record the split?
+
+**Decision.** Unify on 3.7.7, pinned in `[env:pico]` so every environment
+inherits it. 3.7.7 is also the newest published version (2026-05-12), so this
+is not a bump on both sides — it is the device-only environments moving up to
+what phase 2 was already running.
+
+**Why the version is not the main point.** The split made `pico_cdc`'s stack a
+side effect of a *different* dependency. Remove or reorder the Pico-PIO-USB
+entry and phase 2 silently falls back to 3.4.4, where the FTDI async control
+path is a `// TODO not implemented yet` stub — which was cause 1 of the core1
+hang fixed in `a82f34e`. Pinning on the base environment removes that failure
+mode. It also removes the one that already cost real time: reading the core's
+3.4.4 source while the registry's 3.7.7 was being compiled produced two
+confident and wrong conclusions (FINDINGS.md).
+
+**What it cost, and why it was cheap.** Phase 1's numbers were measured on
+3.4.4, so they had to be re-measured rather than assumed. On the loopback rig,
+on 3.7.7: five bauds returning all 4096 bytes; five throughput sweeps matching
+the recorded table within noise (50.2 → 50.0–50.2 kB/s at 460800); zero bytes
+lost anywhere; and the `__usb_mutex` wedge did not recur — 82 seconds of
+one-a-second status lines across two sweeps with monotonic uptime, `boot=soft`,
+`last=none`, no watchdog reset and no drops or stalls. That last check is the
+one that mattered: the wedge used to appear within one or two sweeps, and
+`src/usb_lock.h` binds to whichever TinyUSB copy is compiled, because the
+core's own `__usb_mutex` is compiled out under `USE_TINYUSB`
+(`RP2040USB.cpp:22`) and the library's rp2040 port defines it instead.
+
+**What this does not settle.** Phase 2 throughput is still unmeasured
+(OPEN-ISSUES 6), and unifying the version did not fix the phase 2 byte loss —
+it did usefully narrow it, since phase 1 now loses nothing at 9600 on the same
+stack that loses ~600 bytes there through the CDC backend.

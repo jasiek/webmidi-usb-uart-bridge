@@ -111,6 +111,13 @@ that matters is whether `from_dev` is still advancing *during* the transfer,
 and the one attempt to sample that was spoiled by the board stalling on
 issue 1 partway through. Redo it once issue 1 is contained.
 
+**One variable removed.** Phase 1 and phase 2 now build the same TinyUSB
+(issue 5), and on that same stack the hardware-UART loopback returns all 4096
+bytes at 9600 where the CDC backend loses ~600. The loss is in the CDC path or
+the adapter, not in the engine, the SysEx framing, the credit windowing or the
+USB device stack — all of which the phase 1 rig exercises identically and
+without loss.
+
 **Where to look.** `lines=0x03` — TinyUSB asserts DTR and RTS during
 enumeration (`CFG_TUH_CDC_LINE_CONTROL_ON_ENUM`, not overridable) while CTS is
 floating on the bench rig. If the FT232R has RTS/CTS flow control enabled it
@@ -142,36 +149,40 @@ and see whether it enumerates there.
 
 ---
 
-## 5. `pico` and `pico_cdc` build against different TinyUSB versions
+## 5. ~~`pico` and `pico_cdc` build against different TinyUSB versions~~ — fixed
 
-**Severity: medium. Half-fixed.**
+**Resolved 2026-08-18. Kept for the re-validation evidence.**
 
-Naming Pico-PIO-USB in `lib_deps` makes the library dependency finder resolve
-Adafruit TinyUSB from the registry for that environment, instead of using the
-copy bundled with the core. The result:
+Every environment now builds Adafruit TinyUSB 3.7.7, pinned in `[env:pico]` and
+inherited by the rest. 3.7.7 was already the newest published version, so this
+moved `pico` and `pico_debug` up to what phase 2 was running rather than
+bumping both. DECISIONS.md D14 has the reasoning; the part worth repeating here
+is that the split made phase 2's stack a side effect of the Pico-PIO-USB
+dependency sitting next to it, so dropping that entry would have silently
+reverted phase 2 to the 3.4.4 stub that caused the core1 hang.
 
-| Environment  | TinyUSB | From                                      |
-| ------------ | ------- | ----------------------------------------- |
-| `pico`       | 3.4.4   | `framework-arduinopico/libraries/`        |
-| `pico_debug` | 3.4.4   | same                                      |
-| `pico_cdc`   | 3.7.7   | `.pio/libdeps/`, now pinned in `platformio.ini` |
-| `pico_cdc_debug` | 3.7.7 | same                                     |
+Confirm which copy an environment compiled by the object path, not the source
+tree:
 
-The version is pinned now, so it is a decision rather than a download date, but
-**the divergence itself remains**: two USB stacks in one project, and the phase
-1 throughput measurements in FINDINGS.md were taken on a stack that phase 2
-does not use.
+```
+find .pio/build/pico -name 'cdc_host.c.o'
+# .pio/build/pico/lib4b0/Adafruit TinyUSB Library/...   registry, 3.7.7
+# .pio/build/pico/libXXX/Adafruit_TinyUSB_Arduino/...   core's bundled 3.4.4
+```
 
-The versions differ in ways that matter — 3.4.4 has FTDI's `set_line_coding`,
-`set_data_format` and the whole async path as `// TODO not implemented yet`
-stubs, and no PL2303 driver at all — so this is not a cosmetic difference.
+**Re-validated on the loopback rig** (GPIO0–GPIO1 jumper), because the phase 1
+numbers in FINDINGS.md had been measured on 3.4.4:
 
-**Next step.** Decide whether to move every environment to 3.7.7. That means
-re-validating phase 1 on it, including the throughput sweep and the
-`__usb_mutex` wedge fix, so it is not free. Leaving it as-is is defensible but
-should be a recorded decision rather than an accident.
+- `loopback.js`, twice: all five bauds, 4096 of 4096 bytes each time.
+- Five throughput sweeps, matching the recorded table within noise — 6.4/5.6,
+  12.8/11.2, 25.4/22.5, 50.0–50.2/44.5 kB/s. Zero bytes lost at any baud.
+- A 64 KB bulk transfer at 460800: 45.8 kB/s out, 44.7 kB/s back, 0 lost.
+- No `__usb_mutex` wedge. It used to appear within one or two sweeps; two
+  sweeps on `pico_debug` gave 82 consecutive status lines with monotonic
+  uptime, `boot=soft(last=none)`, `dropped=0 stalls=0` and never `BLOCKED`.
 
----
+921600 no longer appears in the sweep because `INFO.maxBaud` reports 460800
+(D5). That is the old row disappearing, not a regression.
 
 ## 6. Phase 2 throughput has never been measured
 

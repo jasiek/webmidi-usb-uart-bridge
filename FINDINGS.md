@@ -262,8 +262,20 @@ next person does not rediscover them.
   adapter could never work.
 - The way to check which one is being built is the object file, not the source
   tree: `find .pio/build/<env> -name 'cdc_host*.o'` names the library directory
-  it came from. `platformio.ini` now pins the version so this is a decision
-  rather than a download date.
+  it came from.
+- **Resolved by unifying on 3.7.7**, pinned in `[env:pico]` so every
+  environment inherits it rather than each resolving its own (DECISIONS.md
+  D14). The subtle part is why the pin belongs on the *base* environment: with
+  it only on `pico_cdc`, that environment's 3.7.7 was contingent on the
+  Pico-PIO-USB entry beside it, and removing that entry would have dropped
+  phase 2 back to the 3.4.4 stub that caused the core1 hang.
+- The phase 1 measurements below were taken on 3.4.4 and were re-taken on
+  3.7.7 rather than assumed to carry over: same throughput within noise, no
+  bytes lost, and no recurrence of the `__usb_mutex` wedge. That last one is
+  not free — `src/usb_lock.h` binds to whichever TinyUSB copy is compiled,
+  because the core's own `__usb_mutex` is compiled out under `USE_TINYUSB`
+  (`RP2040USB.cpp:22`) and the library's rp2040 port defines it instead.
+  OPEN-ISSUES.md 5 has the numbers.
 
 ## Phase 2 on hardware, first run
 
@@ -404,7 +416,9 @@ difference between a slow loop and one that never returns.
 ## Measured limits
 
 From `host/bin/throughput.js` on a Pico 1 over CoreMIDI, with the loopback
-jumper fitted:
+jumper fitted. Originally measured on TinyUSB 3.4.4 and confirmed unchanged on
+3.7.7 (DECISIONS.md D14); the 921600 row is from before `INFO.maxBaud` dropped
+to 460800, and the sweep now skips it:
 
 | Baud   | Line rate  | host → UART | UART → host | Lost |
 | ------ | ---------- | ----------- | ----------- | ---- |
