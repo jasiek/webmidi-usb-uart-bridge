@@ -232,18 +232,52 @@ the rings, the pumps, the credit windowing or the device stack.
 at every size: 128 → 122, 256 → 230. So "we firehose the adapter faster than
 its UART drains" does not survive contact either, at least not on its own.
 
-**Where to look next.** TinyUSB's FTDI receive path at `cdc_host.c:704-712`
-strips the FTDI's 2-byte status header from *the start of the transfer* rather
-than from each 64-byte packet in it, and discards the whole transfer when
-`xferred_bytes <= 2`. On a multi-packet IN transfer that mishandles every
-packet after the first. Stated as a candidate, not a diagnosis: it has not been
-confirmed, and the arithmetic has not been made to fit yet. The other honest
-possibility is that this adapter, or the short on it, is simply bad — which
-issue 4's cheap test would help settle.
+**It is not truncation — individual bytes are dropped from the middle.** Sending
+`0x00,0x01,0x02,…` and aligning what came back against what went out:
+
+```
+sent 4096, returned 3443, short by 653
+diverges at offset 12
+sent : 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13
+got  : 08 09 0a 0b 0d 0e 0f 10 11 12 13 14
+                    ^^ 0x0c never came back; everything after shifts by one
+```
+
+So the far end is not stopping early and it is not stalling — it is losing
+bytes one at a time, all the way through, at roughly 16% of the stream. That
+kills "it ran out of time" for good, and it also kills the framing of this
+issue as a *stall*: the earlier `from_dev` freeze is the tail of the loss, not
+its mechanism.
+
+**Leading hypothesis: nothing paces our writes to the far end's line rate.**
+`tuh_cdc_write()` accepts bytes at USB speed and `tuh_cdc_write_available()`
+reports space in *TinyUSB's* FIFO, not the adapter's. At 9600 baud the FT232R
+can clock out 960 bytes a second and we hand it bytes several thousand times
+faster, with no end-to-end back-pressure anywhere in between. Phase 1 never had
+this problem because `UartBackend::write` gates on `uart_is_writable()`, which
+is real hardware back-pressure; the USB hop hides it. It also explains the baud
+dependence exactly — the faster the line, the smaller the mismatch.
+
+**What would confirm it**, and is the obvious next step: pace the outbound pump
+to the configured baud (a token bucket in `pumpDevice`, bytes ≈ elapsed × baud
+÷ 10) and see whether the loss disappears. If it does, that is both the
+diagnosis and the fix.
+
+**Not yet characterised**, and worth doing first because it is cheap: the
+*distribution* of the drops. A buffer overrun should lose contiguous runs when
+the buffer fills, not scattered single bytes, and the one run measured so far
+starts with a single-byte drop at offset 12 — early, and small. `gaps.mjs` in
+the session scratchpad does this analysis; the run was cut short by issue 1
+wedging core1 mid-transfer.
+
+The older candidate — TinyUSB stripping the FTDI's 2-byte status header from
+the start of the transfer rather than from each 64-byte packet
+(`cdc_host.c:704-712`) — is now *less* likely: that would inject extra bytes,
+and what is observed is bytes going missing.
 
 ---
 
-## 4. Two full-speed adapters never enumerate at all
+## 4. Enumeration stops for good once the root port is stuck suspended
 
 **Severity: medium. Possibly not our problem, but unexplained.**
 
@@ -258,10 +292,61 @@ claim came from reading 3.4.4 by mistake (issue 5) and has been retracted.
 Enumeration happens below the class drivers in any case, and enumeration is
 what is failing.
 
-Plausibly the same root cause as issue 1 — a device that answers a control
-request slowly or not at all — in which case it resolves with that. Plausibly
-just two bad adapters. Cheap test: try each one on a host that is known good
-and see whether it enumerates there.
+**The FTDI does it too, and there is a deadlock in the library that explains
+why replugging never helps.** Observed 2026-08-18: after core1 wedged, the
+FT232R that had been working sat at `conn=1 fullspeed=1 susp=1` and never
+enumerated again, through a replug and through a reboot.
+
+Watching a live unplug/replug with the port already stuck:
+
+| | `bus` | `conn` | `susp` |
+| --- | --- | --- | --- |
+| before unplug | 10 | 1 | 1 |
+| unplugged     | 00 | 1 | 1 |
+| replugged     | 10 | 1 | 1 |
+
+`conn` never drops. It cannot, and the reason is a short-circuit in
+`pio_usb_host.c:266`:
+
+```c
+if (!(root->initialized && root->connected && !root->suspended &&
+      connection_check(root))) { continue; }
+```
+
+`connection_check()` is the *only* code that detects a disconnect and clears
+`root->connected` (line 229). It is the last term of a `&&` chain, so it is
+never evaluated while `root->suspended` is true. And the matching
+new-connection scan (line 332) runs only `if (root->initialized &&
+!root->connected)`.
+
+So `connected && suspended` is a trap with no exit: disconnects cannot be seen
+because the port is suspended, and connects cannot be seen because the port
+still believes something is connected. Only `pio_usb_host_port_reset_end()`
+clears `suspended`, and TinyUSB calls that solely as part of enumerating a
+device it has just been told about — which is the thing that is not happening.
+
+The state is entered legitimately: on connect the library sets
+`suspended = true` with the comment `// need a bus reset before operating`
+(line 340), expecting TinyUSB to reset the port promptly. If enumeration hangs
+or never starts, the port is stuck there for good.
+
+**The recovery that works is replug *and* `REBOOT`, in that order.** Neither
+alone does: the replug cannot be seen by a suspended port, and a reboot alone
+leaves the adapter holding its old USB address. Together they enumerate first
+time — confirmed, `attached=1 enum=1(0403:6001) susp=0`.
+
+**The fix this suggests** is ours to make and does not need the library
+changed: `pio_usb_host_port_reset_start/end` are declared in `pio_usb_ll.h`,
+which `src/pio_usb_probe.c` already includes. Core1 could watch for
+`connected && suspended` persisting with nothing enumerated, and drive a reset
+cycle to clear `suspended` so `connection_check()` can run again. Clearing
+`connected` as well — to force the connect scan to re-fire — means writing to
+another library's state, which is the same category of move that was rejected
+for the core1 restart, so it wants a decision rather than a commit.
+
+Still worth doing: try the two original adapters on a known-good host. But
+"two bad adapters" is no longer the leading explanation, because the adapter
+that works reaches the same state.
 
 ---
 

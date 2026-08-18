@@ -365,6 +365,27 @@ next person does not rediscover them.
   them from core1, where the `tuh_*` calls belong; asking the host stack a
   question from core0 is how this backend got its first wedge.
 
+- **`connected && suspended` is a trap the root port cannot leave.** The only
+  disconnect detection, `connection_check()`, is the last term of a `&&` chain
+  guarded by `!root->suspended` (`pio_usb_host.c:266`), and the new-connection
+  scan needs `!root->connected` (line 332). A port that ends up in both states
+  can therefore see neither edge, and replugging the device changes nothing —
+  `conn` stays 1 across an unplug, which reads like a wiring fault and is not
+  one. Entered legitimately on every connect (`suspended = true; // need a bus
+  reset before operating`), and left only by `pio_usb_host_port_reset_end()`,
+  which TinyUSB calls only while enumerating. So any enumeration that hangs
+  strands the port permanently.
+- **The recovery is a replug *and* a reboot, in that order.** Neither works
+  alone: a suspended port cannot see the replug, and a warm reboot leaves the
+  adapter holding the USB address it was given before the reset. Together they
+  enumerate first time.
+- **The phase 2 byte loss drops single bytes from the middle of the stream**,
+  not the tail. Sending `00 01 02 …` and aligning the return shows `0x0c`
+  missing at offset 12 with everything after shifted by one, ~16% of the stream
+  gone that way. Worth knowing before theorising: "short by 600 bytes" sounds
+  like a truncation and is not one, and the counter that made it look like a
+  stall was measuring the end of the loss rather than its cause.
+
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs

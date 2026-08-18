@@ -12,6 +12,7 @@
     "loopback": "node bin/loopback.js",
     "probe": "node bin/probe.js",
     "throughput": "node bin/throughput.js",
+    "gaps": "node bin/gap-analysis.mjs",
     "list": "node bin/list-ports.js"
   },
   "dependencies": {
