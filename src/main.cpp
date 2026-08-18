@@ -104,6 +104,7 @@ constexpr unsigned kPhaseSink = 3;
 constexpr unsigned kPhaseLed = 4;
 constexpr unsigned kPhaseDebug = 5;
 unsigned lastPhaseBeforeReset = 0;
+bool rebootWasCommanded = false;
 
 const char* phaseName(unsigned code) {
   switch (code) {
@@ -155,7 +156,8 @@ void serviceDebug(uint32_t nowMs) {
       "t=%lus boot=%s(last=%s) loops=%lu midi_in=%lu sysex=%lu | state=%d rx=%lu tx=%lu"
       " | sink buf=%u out=%lu dropped=%lu stalls=%lu%s"
       " | capped=%lu max_us midi=%lu poll=%lu sink=%lu loop=%lu\r\n",
-      static_cast<unsigned long>(nowMs / 1000), resetReasonName(bootReason),
+      static_cast<unsigned long>(nowMs / 1000),
+      rebootWasCommanded ? "REBOOT-cmd" : resetReasonName(bootReason),
       phaseName(lastPhaseBeforeReset),
       static_cast<unsigned long>(loops), static_cast<unsigned long>(midiBytesIn),
       static_cast<unsigned long>(sysexIn), static_cast<int>(gBridge.state()),
@@ -291,6 +293,14 @@ void pumpUsbMidi(uint32_t nowMs) {
 // it. scratch[4..7] are free for application use.
 extern "C" void bridgePhase(unsigned code) { watchdog_hw->scratch[4] = code; }
 
+// scratch[5] carries one bit of intent across the reset that REBOOT causes.
+// Without it a commanded reboot is indistinguishable from the soft reset an
+// upload does — both leave WATCHDOG_REASON_TIMER_BITS set, so the core reports
+// SOFT_RESET for each. A board that reboots when nobody asked it to is a very
+// different thing from one that did as it was told, and the first is the one
+// worth noticing.
+constexpr uint32_t kRebootMagic = 0x5245424fu;  // 'REBO'
+
 // The 1200-baud touch — the convention every Arduino-family board uses to mean
 // "reboot into the bootloader". arduino-pico only implements it in its own
 // SerialUSB, which is compiled out under USE_TINYUSB, so without this the
@@ -331,6 +341,8 @@ void setup() {
   // still holds the phase that was executing when the CPU stopped.
   lastPhaseBeforeReset = watchdog_hw->scratch[4];
   watchdog_hw->scratch[4] = 0;
+  rebootWasCommanded = (watchdog_hw->scratch[5] == kRebootMagic);
+  watchdog_hw->scratch[5] = 0;
 
   gBridge.begin(millis());
   rp2040.wdt_begin(kWatchdogMs);
@@ -365,6 +377,17 @@ void loop() {
   bridgePhase(kPhaseSink);
   sink.service(nowMs);
   recordMax(phaseMax.sink, phase);
+
+  // After sink.service() and before anything else: the engine says when a
+  // REBOOT's grace period is up, but the acknowledgement is only *ours* once
+  // the sink has actually pushed it into TinyUSB. Rebooting with it still
+  // buffered would leave the host having asked a question that was never
+  // answered — and this is a command whose whole purpose is to be used when
+  // the host has already stopped trusting the device. See PROTOCOL.md 5.10.
+  if (gBridge.rebootDue(nowMs) && sink.buffered() == 0) {
+    watchdog_hw->scratch[5] = kRebootMagic;
+    rp2040.reboot();  // does not return
+  }
 
   bridgePhase(kPhaseLed);
   serviceLed(nowMs);

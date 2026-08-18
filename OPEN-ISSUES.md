@@ -61,9 +61,9 @@ visible. It is not recoverable.
 
 ---
 
-## 2. Nothing restarts a wedged core1
+## 2. Nothing restarts a wedged core1 — recoverable now, on the host's word
 
-**Severity: high. The other half of issue 1.**
+**Severity: reduced from high on 2026-08-18. Recovery exists; it costs a reboot.**
 
 Surviving the hang and recovering from it are different things, and only the
 first is done. When core1 stops:
@@ -72,9 +72,20 @@ first is done. When core1 stops:
   fed — this all works and is the point of the two-core split (DECISIONS.md D8).
 - `claimOp()` sees `hostAlive()` false and fails immediately, so ops no longer
   cost a one-second timeout each. Also works.
-- But the port stays `Fault` until the board is power-cycled. Nothing reclaims
-  a mailbox from a core that is never coming back, and nothing restarts the
-  core.
+- The port stays `Fault`, and nothing reclaims a mailbox from a core that is
+  never coming back or restarts the core. **Still true**, and not fixable in
+  place — see below.
+- **What changed:** it no longer needs physical access. `REBOOT` (PROTOCOL.md
+  §5.10, DECISIONS.md D15) lets the host reset the board over the tunnel that
+  is still up, and `client.reboot()` drives it. The device never does this on
+  its own initiative, which is deliberate: D15 has the argument.
+
+Confirmed end to end on hardware — acknowledged in 1 ms, board reset and came
+back reporting `boot=REBOOT-cmd`, with the loopback suite clean afterwards.
+
+What is still owed here is the *in-place* recovery: a wedge costs a full reboot
+and everything buffered with it. That is a real cost, and if issue 1 is ever
+fixed upstream this issue mostly goes away with it.
 
 Worth separating from issue 1 because it is *ours* and would be worth doing
 even if TinyUSB grew a timeout tomorrow: any backend on a separate core needs a

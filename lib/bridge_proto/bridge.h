@@ -45,6 +45,14 @@ class Bridge {
   void poll(uint32_t nowMs);
 
   PortState state() const { return state_; }
+
+  // A REBOOT has been acknowledged and its grace period has expired, so the
+  // platform may now reset the board. The engine deliberately does not reset
+  // anything itself: lib/bridge_proto is free of Arduino and RP2040 headers so
+  // it can be tested on the host (DECISIONS.md D1), and "reboot the machine"
+  // is the least portable operation there is. It says when; main.cpp says how,
+  // and waits for its own transport to drain before it does.
+  bool rebootDue(uint32_t nowMs) const;
   uint32_t rxCount() const { return rxCount_; }
   uint32_t txCount() const { return txCount_; }
 
@@ -59,6 +67,7 @@ class Bridge {
   void handleCredit(FrameReader& r);
   void handlePing(FrameReader& r);
   void handleReset(uint32_t nowMs);
+  void handleReboot(uint32_t nowMs);
 
   // --- outbound frames ---
   void sendInfo();
@@ -98,6 +107,10 @@ class Bridge {
   // Host capabilities, learned from HELLO; defaults are the protocol floor.
   uint16_t hostRxBuffer_ = kRxBufferSize;
   uint16_t hostMaxRaw_ = kMaxDataRaw;
+
+  // Set by REBOOT, never cleared: the only thing that follows is the reset.
+  bool rebootPending_ = false;
+  uint32_t rebootAt_ = 0;
 
   uint8_t lastInputLines_ = 0;
   bool lastPresent_ = true;

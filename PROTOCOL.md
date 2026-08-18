@@ -107,6 +107,7 @@ host→device commands are `0x01–0x3F`, device→host are `0x41–0x7F`.
 | 0x08 | `PING`      | 0–8 opaque bytes, echoed verbatim                   |
 | 0x09 | `GET_STATUS`| —                                                   |
 | 0x0A | `RESET`     | —                                                   |
+| 0x0B | `REBOOT`    | — (§5.10)                                           |
 
 ### 4.2 Device → host
 
@@ -120,8 +121,8 @@ host→device commands are `0x01–0x3F`, device→host are `0x41–0x7F`.
 | 0x4E | `ERROR`   | `u7` code, `u7` detail (§5.5)               |
 | 0x4F | `EVENT`   | `u7` event, `u7` arg (§5.6)                 |
 
-`HELLO`, `OPEN`, `RESET`, `PING`, `GET_STATUS` and `CREDIT` are legal whether
-or not a port is open. Any other host→device command received while the port
+`HELLO`, `OPEN`, `RESET`, `REBOOT`, `PING`, `GET_STATUS` and `CREDIT` are legal
+whether or not a port is open. Any other host→device command received while the port
 is closed is answered with `ERROR(ERR_NOT_OPEN)`.
 
 `CREDIT` is on that list because a device goes on delivering bytes it received
@@ -228,6 +229,7 @@ when the field did not.
 | 0x03 | `EVT_OVERRUN`  | 0                                    |
 | 0x04 | `EVT_ATTACH`   | backend id — far end appeared        |
 | 0x05 | `EVT_DETACH`   | backend id — far end went away       |
+| 0x06 | `EVT_REBOOTING`| backend id — device is about to reset (§5.10) |
 
 ### 5.7 Capability bits
 
@@ -292,6 +294,39 @@ is still buffered *and* whatever has been framed but not yet transmitted, so
 nothing from the old session can arrive numbered for the new one. A host that
 wants the tail must read it before reopening. A device that has nothing left
 to say emits nothing, so a host that does not care can simply reopen.
+
+### 5.10 `REBOOT`
+
+`REBOOT` asks the device to reset itself. It takes no payload, it is legal with
+no port open, and it is answered with `EVT_REBOOTING` and then silence.
+
+It exists because some faults are visible to the device and not repairable by
+it. The one it was added for is a USB host stack wedged on the second core: the
+first core can see that it has stopped, can report `ERR_BACKEND` and can keep
+this tunnel up to say so, but cannot restart it — the libraries involved
+support no teardown, and re-initialising over the top of them panics. Without
+`REBOOT` the only recovery is physical access to the board, which is the exact
+thing a device driven from a phone cannot assume.
+
+The device:
+
+1. emits `EVT_REBOOTING` with its backend id,
+2. waits at least 100 ms, and until that event has actually reached the
+   transport, and
+3. resets.
+
+Nothing is closed and nothing is discarded first. A `CLOSE` would mean reaching
+a backend that may be precisely what is broken, and discarding would throw away
+the acknowledgement along with everything else. The reset settles all of it.
+
+A host must expect the device to **disappear from the bus and re-enumerate**.
+This is not a session boundary like `OPEN` or `RESET` — it is the device going
+away. Everything buffered in either direction is lost, and a host that had a
+port open will not have one afterwards. Reconnecting is a fresh `HELLO`.
+
+`REBOOT` is not a way to recover a confused session; `RESET` is, it is cheaper,
+and it keeps the link up. Use `REBOOT` when `RESET` cannot help — when the
+device reports a fault it cannot clear.
 
 ## 6. Flow control
 

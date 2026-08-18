@@ -29,6 +29,7 @@ export const Cmd = Object.freeze({
   PING: 0x08,
   GET_STATUS: 0x09,
   RESET: 0x0a,
+  REBOOT: 0x0b,
 });
 
 /** Device → host. */
@@ -74,6 +75,7 @@ export const Evt = Object.freeze({
   OVERRUN: 0x03,
   ATTACH: 0x04,
   DETACH: 0x05,
+  REBOOTING: 0x06,
 });
 
 /** Output control lines (SET_LINES, STATUS.outLines). */

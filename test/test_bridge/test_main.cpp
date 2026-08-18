@@ -666,6 +666,62 @@ static void test_reset_closes_the_port(void) {
   TEST_ASSERT_EQUAL_UINT32(0, br->rxCount());
 }
 
+static void test_reboot_is_acknowledged_before_it_happens(void) {
+  openPort();
+  feedSimple(Cmd::Reboot);
+
+  // The acknowledgement goes out first, and nothing is due yet: a device that
+  // reset the instant it was asked would never be heard to agree.
+  const CapturedFrame* ev = sink->first(Rsp::Event);
+  TEST_ASSERT_NOT_NULL(ev);
+  FrameReader r;
+  FrameReader::parse(ev->bytes.data(), ev->bytes.size(), r);
+  uint8_t evt = 0, arg = 0;
+  r.u7(evt);
+  r.u7(arg);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Evt::Rebooting), evt);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(backend->id()), arg);
+  TEST_ASSERT_FALSE(br->rebootDue(clockMs));
+
+  // Still not due one millisecond short of the grace period, due on it.
+  TEST_ASSERT_FALSE(br->rebootDue(clockMs + kRebootGraceMs - 1));
+  TEST_ASSERT_TRUE(br->rebootDue(clockMs + kRebootGraceMs));
+}
+
+static void test_reboot_is_legal_with_no_port_open(void) {
+  // The case REBOOT exists for is a backend that cannot be opened at all, so
+  // requiring an open port would make it useless exactly when it is wanted.
+  feedSimple(Cmd::Hello);
+  sink->clear();
+  feedSimple(Cmd::Reboot);
+
+  TEST_ASSERT_EQUAL_INT(0, sink->count(Rsp::Error));
+  TEST_ASSERT_EQUAL_INT(1, sink->count(Rsp::Event));
+  TEST_ASSERT_TRUE(br->rebootDue(clockMs + kRebootGraceMs));
+}
+
+static void test_reboot_does_not_close_the_port_or_discard_output(void) {
+  openPort();
+  for (int i = 0; i < 200; ++i) backend->incoming.push_back(0x5A);
+  tick();
+  sink->discards = 0;
+
+  feedSimple(Cmd::Reboot);
+
+  // Unlike RESET, which is a session boundary, REBOOT is the device leaving.
+  // Discarding would throw the acknowledgement away with everything else, and
+  // closing would mean reaching a backend that may be the thing that is broken.
+  TEST_ASSERT_EQUAL_INT(0, sink->discards);
+  TEST_ASSERT_EQUAL(PortState::Open, br->state());
+  TEST_ASSERT_TRUE(backend->isOpen());
+}
+
+static void test_nothing_is_due_without_a_reboot_being_asked_for(void) {
+  openPort();
+  tick(60000);
+  TEST_ASSERT_FALSE(br->rebootDue(clockMs));
+}
+
 static void test_flush_discards_the_requested_direction(void) {
   openPort();
   backend->txCapacity = 0;  // nothing can leave, so the buffer holds
@@ -1187,6 +1243,10 @@ int main(int, char**) {
   RUN_TEST(test_future_version_gets_one_error);
   RUN_TEST(test_hello_discards_stale_output);
   RUN_TEST(test_reset_discards_stale_output);
+  RUN_TEST(test_reboot_is_acknowledged_before_it_happens);
+  RUN_TEST(test_reboot_is_legal_with_no_port_open);
+  RUN_TEST(test_reboot_does_not_close_the_port_or_discard_output);
+  RUN_TEST(test_nothing_is_due_without_a_reboot_being_asked_for);
   RUN_TEST(test_the_tail_of_a_closed_session_is_credited_out);
   RUN_TEST(test_open_discards_frames_left_over_from_the_previous_session);
   RUN_TEST(test_full_duplex_bulk_transfer);

@@ -43,6 +43,13 @@ constexpr size_t kMaxDataRaw = 128;
 // RP2040 has 264 KB of SRAM and a stalled window costs more than the memory.
 constexpr uint16_t kRxBufferSize = 2048;
 
+// How long a device waits between acknowledging a REBOOT and actually
+// resetting. Long enough for EVT_REBOOTING to be framed and handed to the
+// transport, short enough that a host asking for a reboot is not left
+// wondering. The platform is expected to wait for its own transport to drain
+// as well; this is the floor, not the whole wait. PROTOCOL.md §5.10.
+constexpr uint32_t kRebootGraceMs = 100;
+
 // ---- commands --------------------------------------------------------------
 
 // Host → device, 0x01–0x3F.
@@ -57,6 +64,7 @@ enum class Cmd : uint8_t {
   Ping = 0x08,
   GetStatus = 0x09,
   Reset = 0x0A,
+  Reboot = 0x0B,
 };
 
 // Device → host, 0x41–0x7F.
@@ -91,6 +99,7 @@ enum class Evt : uint8_t {
   Overrun = 0x03,
   Attach = 0x04,
   Detach = 0x05,
+  Rebooting = 0x06,
 };
 
 // Output control lines (SET_LINES, STATUS.out_lines).

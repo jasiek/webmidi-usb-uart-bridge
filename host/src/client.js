@@ -143,6 +143,30 @@ export class BridgeClient extends Emitter {
     return this.#readStatus(status);
   }
 
+  // Ask the device to reset itself, and resolve when it says it will.
+  //
+  // Deliberately not a #request: the reply is an EVENT rather than a STATUS,
+  // and what follows it is the device leaving the bus — so there is no reply
+  // to wait for beyond the acknowledgement, and waiting for one would always
+  // time out. The caller is reconnecting afterwards either way; this exists so
+  // that "did it hear me?" has an answer. PROTOCOL.md §5.10.
+  reboot({ timeoutMs = 2000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.off('event', onEvent);
+        reject(new Error('no EVT_REBOOTING; the device did not acknowledge the reboot'));
+      }, timeoutMs);
+      const onEvent = ({ event, arg }) => {
+        if (event !== Evt.REBOOTING) return;
+        clearTimeout(timer);
+        this.off('event', onEvent);
+        resolve(arg);
+      };
+      this.on('event', onEvent);
+      this.transport.send(new FrameBuilder(Cmd.REBOOT).build());
+    });
+  }
+
   async getStatus() {
     const status = await this.#request(new FrameBuilder(Cmd.GET_STATUS).build(), Rsp.STATUS);
     return this.#readStatus(status);
@@ -425,6 +449,14 @@ export class BridgeClient extends Emitter {
           // open, not that one has been opened.
           if (this.state === PortState.FAULT) this.state = PortState.CLOSED;
           this.emit('attach', arg);
+        }
+        if (event === Evt.REBOOTING) {
+          // The device is about to leave the bus, so everything this client
+          // believes about a port is about to stop being true. Say so now
+          // rather than let callers discover it as a string of timeouts.
+          this.attached = false;
+          this.state = PortState.FAULT;
+          this.emit('rebooting', arg);
         }
         if (event === Evt.DETACH) {
           this.attached = false;

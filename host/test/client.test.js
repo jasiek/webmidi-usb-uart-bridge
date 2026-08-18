@@ -490,3 +490,64 @@ test('waitForAttach returns once something is plugged in', async () => {
   assert.equal(client.attached, true);
   client.destroy();
 });
+
+test('reboot resolves on the acknowledgement, not on a reply that never comes',
+  async () => {
+    const device = new FakeDevice();
+    const client = new BridgeClient(device);
+    await client.hello();
+    await client.open({ baud: 115200 });
+
+    const backendId = await client.reboot();
+
+    assert.equal(device.rebooted, true, 'the device was never asked to reboot');
+    assert.equal(backendId, BackendId.HARDWARE_UART);
+    client.destroy();
+  });
+
+test('reboot gives up rather than hanging if the device says nothing',
+  async () => {
+    // A device wedged badly enough not to answer is exactly the device a host
+    // reaches for REBOOT on, so failing to acknowledge has to be survivable.
+    const device = new FakeDevice();
+    const client = new BridgeClient(device);
+    await client.hello();
+
+    device.send = () => {};  // swallow it: no EVT_REBOOTING comes back
+    await assert.rejects(client.reboot({ timeoutMs: 50 }), /did not acknowledge/);
+    client.destroy();
+  });
+
+test('a rebooting device stops being treated as usable', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.hello();
+  await client.open({ baud: 115200 });
+  assert.equal(client.state, PortState.OPEN);
+
+  const seen = [];
+  client.on('rebooting', (arg) => seen.push(arg));
+  await client.reboot();
+
+  // The board is about to leave the bus. A client still reporting OPEN would
+  // let callers queue writes into a device that is no longer there.
+  assert.deepEqual(seen, [BackendId.PIO_USB_CDC]);
+  assert.equal(client.state, PortState.FAULT);
+  assert.equal(client.attached, false);
+  client.destroy();
+});
+
+test('REBOOT is accepted with no port open', async () => {
+  const device = new FakeDevice();
+  const client = new BridgeClient(device);
+  await client.hello();
+
+  // ERR_NOT_OPEN is what a command that needed a port would come back with.
+  const errors = [];
+  client.on('error', (e) => errors.push(e.code));
+  await client.reboot();
+
+  assert.deepEqual(errors, [], 'REBOOT was refused while the port was closed');
+  assert.equal(device.rebooted, true);
+  client.destroy();
+});

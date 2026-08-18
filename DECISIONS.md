@@ -397,3 +397,59 @@ core's own `__usb_mutex` is compiled out under `USE_TINYUSB`
 (OPEN-ISSUES 6), and unifying the version did not fix the phase 2 byte loss —
 it did usefully narrow it, since phase 1 now loses nothing at 9600 on the same
 stack that loses ~600 bytes there through the CDC backend.
+
+### D15. Recovery from a wedged core1 is `REBOOT`, and the host asks for it
+
+**Question.** Core0 can see that core1's USB host stack has stopped
+(OPEN-ISSUES 1) but cannot restart it — `tuh_deinit()` is inert for this port,
+Pico-PIO-USB unclaims nothing, and a second `USBHost.begin(1)` panics in the
+SDK. So the only recovery left is resetting the board. Should the device do
+that by itself?
+
+**Decision.** No. A new protocol command, `REBOOT` (0x0B), acknowledged with
+`EVT_REBOOTING` and followed by a reset. The device never reboots on its own
+initiative.
+
+**Why not automatically.** `src/main.cpp` already says, deliberately, that "a
+core1 wedged inside a control transfer to a misbehaving adapter should leave
+the MIDI tunnel up to say so, not reboot the board out from under the host that
+is asking." That is still right. Core0 surviving core1 is the entire point of
+the two-core split (D8), and the value of surviving is that someone can be
+*told*. A device that reacts to a fault by vanishing from the bus destroys the
+evidence and interrupts whoever was mid-conversation, on its own authority, to
+fix something the host might not even care about — the far end may be an
+adapter the host has finished with.
+
+The host has everything it needs to decide: `ERR_BACKEND`, a port stuck in
+`Fault`, and a tunnel that still answers. So it decides.
+
+**Why a new command rather than overloading `RESET`.** `RESET` is a session
+boundary with defined semantics — it discards buffers, resets sequences and
+keeps the link up. Making it sometimes mean "and also disappear from USB for
+two seconds" would make a documented guarantee conditional on device state the
+host cannot see. Same reasoning as D5: a field a host trusts must mean one
+thing.
+
+**Shape of it.** `REBOOT` is legal with no port open, because the case it
+exists for is a backend that cannot be opened at all. It closes nothing and
+discards nothing first: a `CLOSE` would post an op to the very core that is not
+answering, and a discard would throw away the acknowledgement with everything
+else. The engine only decides *when* — `rebootDue()` — because
+`lib/bridge_proto` stays free of Arduino and RP2040 headers (D1); `main.cpp`
+decides how, and waits for the MIDI sink to drain first so the acknowledgement
+is genuinely on the wire before the board goes.
+
+**One bit of intent survives the reset.** `watchdog_hw->scratch[5]` carries a
+magic value across the reboot, because `rp2040.reboot()` leaves exactly the
+same reset reason as an upload's soft reset. Without it a board that rebooted
+because it was told to is indistinguishable from one that rebooted for reasons
+unknown, and only the second is worth investigating. The debug build reports
+`boot=REBOOT-cmd`; confirmed on hardware.
+
+**Cost, stated plainly.** The board leaves the USB bus and re-enumerates, so
+this is not a session boundary but the device going away: everything buffered
+in both directions is lost and the host must reconnect with a fresh `HELLO`.
+PROTOCOL.md §5.10 says so rather than leaving a host to find out. It also does
+not *fix* OPEN-ISSUES 1 — a wedge still costs a reboot. It removes the need for
+physical access, which for a device driven from a phone is the difference
+between a fault and a brick.

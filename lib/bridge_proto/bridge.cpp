@@ -60,7 +60,7 @@ void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
   // do anything to a port that is not there. PROTOCOL.md §4.2.
   if (state_ != PortState::Open && cmd != Cmd::Hello && cmd != Cmd::Reset &&
       cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus &&
-      cmd != Cmd::Credit) {
+      cmd != Cmd::Credit && cmd != Cmd::Reboot) {
     sendError(Err::NotOpen);
     return;
   }
@@ -76,6 +76,7 @@ void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
     case Cmd::Ping:       handlePing(r); break;
     case Cmd::GetStatus:  sendStatus(); break;
     case Cmd::Reset:      handleReset(nowMs); break;
+    case Cmd::Reboot:     handleReboot(nowMs); break;
     default:
       sendError(Err::BadCmd, r.cmd());
       break;
@@ -244,6 +245,30 @@ void Bridge::handleReset(uint32_t nowMs) {
   state_ = PortState::Closed;
   resetSession(nowMs);
   sendStatus();
+}
+
+// A REBOOT is the host saying it would rather have the board back than keep
+// talking to a broken one — the case it exists for is a wedged USB host stack
+// on core1, which cannot be restarted in place (OPEN-ISSUES 2) and which core0
+// can see but not repair. It is deliberately not a port operation: it is legal
+// with no port open, because a port that cannot be opened is exactly when it is
+// wanted.
+//
+// Nothing is closed or discarded on the way out. A CLOSE would try to reach the
+// backend, and on the backend this exists for that means an op posted to a core
+// that is never coming back; a discard would throw away the acknowledgement
+// with everything else. The reset takes care of all of it in a few hundred
+// microseconds anyway.
+void Bridge::handleReboot(uint32_t nowMs) {
+  sendEvent(Evt::Rebooting, static_cast<uint8_t>(backend_.id()));
+  rebootPending_ = true;
+  rebootAt_ = nowMs + kRebootGraceMs;
+}
+
+// Unsigned subtraction, so this stays correct across the millis() wrap that a
+// board left running for 49 days will see.
+bool Bridge::rebootDue(uint32_t nowMs) const {
+  return rebootPending_ && (nowMs - rebootAt_) < (1u << 31);
 }
 
 // ---- outbound --------------------------------------------------------------

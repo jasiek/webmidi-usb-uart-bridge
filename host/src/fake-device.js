@@ -116,6 +116,7 @@ export class FakeDevice {
     const alwaysLegal = [
       Cmd.HELLO,
       Cmd.RESET,
+      Cmd.REBOOT,
       Cmd.OPEN,
       Cmd.PING,
       Cmd.GET_STATUS,
@@ -181,6 +182,16 @@ export class FakeDevice {
         this.state = PortState.CLOSED;
         this.#resetSession();
         this.#sendStatus();
+        break;
+
+      // The real device resets after this, so a fake one that went on
+      // answering would let a test pass against behaviour the hardware does
+      // not have. `rebooted` is what a test asserts on instead.
+      case Cmd.REBOOT:
+        this.#emit(new FrameBuilder(Rsp.EVENT).u7(Evt.REBOOTING)
+            .u7(this.hotplug ? BackendId.PIO_USB_CDC : BackendId.HARDWARE_UART).build());
+        this.rebooted = true;
+        this.state = PortState.FAULT;
         break;
 
       case Cmd.GET_STATUS:
