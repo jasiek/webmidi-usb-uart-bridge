@@ -21,6 +21,9 @@ namespace {
 // quickly.
 constexpr size_t kChunk = 64;
 
+// Chunks moved per direction per serviceHost() turn. See pumpDevice().
+constexpr size_t kMaxChunksPerPump = 8;
+
 }  // namespace
 
 // ---- core0: the Backend interface ------------------------------------------
@@ -227,6 +230,18 @@ void CdcHostBackend::beginHost() {
 // then, with core0 running again and core1 arriving late at the op, clear()
 // would be racing the very core it was supposed to be excluding.
 void CdcHostBackend::executeOp() {
+  // A control transfer from an earlier turn is still out. Nothing else can be
+  // started until it comes back, and if it never does, core1 gives up on it
+  // here — which is the only thing that returns the mailbox to core0.
+  if (xferPending_) {
+    if (millis() - xferStartedAt_ >= kXferTimeoutMs) {
+      ++xferGen_;  // any answer that arrives now belongs to nobody
+      xferPending_ = false;
+      finishOp(false);
+    }
+    return;
+  }
+
   const Op op = static_cast<Op>(op_.load(std::memory_order_acquire));
   // Claimed means core0 has taken the mailbox but has not finished filling it
   // in. Nothing to read yet.
@@ -242,7 +257,9 @@ void CdcHostBackend::executeOp() {
       if (mounted) {
         tuh_cdc_read_clear(idx);
         tuh_cdc_write_clear(idx);
-        ok = applyLineCoding();
+        // Returns without finishing the op: the answer arrives at
+        // onXferComplete(), or kXferTimeoutMs takes it out above.
+        if (startLineCoding()) return;
       }
       break;
 
@@ -252,7 +269,7 @@ void CdcHostBackend::executeOp() {
       break;
 
     case Op::SetLines:
-      ok = mounted ? applyControlLines() : false;
+      if (mounted && startControlLines()) return;
       break;
 
     case Op::Flush:
@@ -280,43 +297,81 @@ void CdcHostBackend::executeOp() {
       break;
   }
 
+  finishOp(ok);
+}
+
+void CdcHostBackend::finishOp(bool ok) {
   opOk_.store(ok, std::memory_order_relaxed);
   // Release: everything above lands before core0 is allowed to observe the
   // op as finished.
   op_.store(static_cast<uint8_t>(Op::None), std::memory_order_release);
 }
 
-bool CdcHostBackend::applyLineCoding() {
-  cdc_line_coding_t lc;
-  lc.bit_rate = pending_.baud;
-  lc.data_bits = pending_.databits;
-  // bridge::Parity and CDC_LINE_CODING_PARITY_* agree on 0/1/2 = none/odd/even.
-  lc.parity = static_cast<uint8_t>(pending_.parity);
-  lc.stop_bits = pending_.stopbits == 2 ? CDC_LINE_CODING_STOP_BITS_2
-                                        : CDC_LINE_CODING_STOP_BITS_1;
-
-  // Blocking form — a null callback makes tuh_cdc_set_line_coding drive the
-  // transfer to completion, pumping tuh_task() itself while it waits. That is
-  // safe here and nowhere else: this runs from loop1(), not from inside a
-  // TinyUSB callback. It also transparently handles the adapters that need
-  // baud and format set as two separate requests (FTDI, CP210x, CH34x).
-  xfer_result_t result = XFER_RESULT_INVALID;
-  const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
-  if (!tuh_cdc_set_line_coding(idx, &lc, nullptr, reinterpret_cast<uintptr_t>(&result)))
-    return false;
-  return result == XFER_RESULT_SUCCESS;
+void CdcHostBackend::onXferComplete(uint32_t gen, bool ok) {
+  // Late answer to a transfer core1 already abandoned. The op it belonged to
+  // has been failed and the mailbox may since have been handed to another one,
+  // so completing anything here would be completing the wrong thing.
+  if (!xferPending_ || gen != xferGen_) return;
+  xferPending_ = false;
+  finishOp(ok);
 }
 
-bool CdcHostBackend::applyControlLines() {
+// Both of these post a request and return. Nothing here waits.
+//
+// The blocking form — a null callback — is what hung core1 on hardware, and
+// the reason is visible in TinyUSB 3.7.7's tuh_cdc_set_line_coding(): FTDI has
+// no set_line_coding of its own, so the call falls through to setting baud and
+// data format as two separate control transfers, and with a null callback each
+// of those is a tuh_control_xfer() that spins until it answers. There is no
+// timeout in it — the field is in the struct with "not supported yet" beside
+// it. An adapter that stops answering therefore takes the core with it.
+//
+// Passing a real callback takes the chained path instead: TinyUSB issues the
+// baudrate request, and its own stage-1 completion issues the data format, and
+// ours is called at the end of both. Core1 stays in its loop throughout.
+namespace {
+// Lives beyond the call because the request outlives it now. One transfer is
+// in flight at a time, by construction — executeOp() will not start a second.
+cdc_line_coding_t gLineCoding;
+
+void onControlXferDone(tuh_xfer_t* xfer) {
+  gCdcHost.onXferComplete(static_cast<uint32_t>(xfer->user_data),
+                          xfer->result == XFER_RESULT_SUCCESS);
+}
+}  // namespace
+
+bool CdcHostBackend::startLineCoding() {
+  gLineCoding.bit_rate = pending_.baud;
+  gLineCoding.data_bits = pending_.databits;
+  // bridge::Parity and CDC_LINE_CODING_PARITY_* agree on 0/1/2 = none/odd/even.
+  gLineCoding.parity = static_cast<uint8_t>(pending_.parity);
+  gLineCoding.stop_bits = pending_.stopbits == 2 ? CDC_LINE_CODING_STOP_BITS_2
+                                                 : CDC_LINE_CODING_STOP_BITS_1;
+
+  const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
+  const uint32_t gen = ++xferGen_;
+  xferPending_ = true;
+  xferStartedAt_ = millis();
+  if (!tuh_cdc_set_line_coding(idx, &gLineCoding, onControlXferDone, gen)) {
+    xferPending_ = false;
+    return false;
+  }
+  return true;
+}
+
+bool CdcHostBackend::startControlLines() {
   // kLineDtr/kLineRts are bits 0 and 1, and so are CDC's DTR and RTS.
   const uint16_t state = pendingLines_ & (kLineDtr | kLineRts);
 
-  xfer_result_t result = XFER_RESULT_INVALID;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
-  if (!tuh_cdc_set_control_line_state(idx, state, nullptr,
-                                      reinterpret_cast<uintptr_t>(&result)))
+  const uint32_t gen = ++xferGen_;
+  xferPending_ = true;
+  xferStartedAt_ = millis();
+  if (!tuh_cdc_set_control_line_state(idx, state, onControlXferDone, gen)) {
+    xferPending_ = false;
     return false;
-  return result == XFER_RESULT_SUCCESS;
+  }
+  return true;
 }
 
 void CdcHostBackend::pumpDevice() {
@@ -326,7 +381,21 @@ void CdcHostBackend::pumpDevice() {
 
   // core0 → adapter. peek/discard rather than read, so a short accept by the
   // USB FIFO leaves the remainder in the ring instead of dropping it.
-  while (true) {
+  //
+  // Bounded, and that is not a tidiness measure. Both of these loops are fed
+  // by the other core — toDevice_ by core0 and, on a looped adapter,
+  // fromDevice_ by our own writes coming back — so "run until there is nothing
+  // left" is a condition the producer can keep false indefinitely. Core1 then
+  // never returns to loop1(), never calls tuh_task(), and the USB stack it is
+  // here to service stops. Phase 1 learned exactly this about pumpUsbMidi and
+  // bounded it at 16 reads; this is the same mistake in the other pump, found
+  // the same way — a frozen host_tasks with core1 stopped in pump_device.
+  //
+  // 8 chunks is 512 bytes a turn, each way. At a quarter of a million turns a
+  // second that is far more than the tunnel can carry, so the bound costs
+  // nothing and only ever binds when something is wrong.
+  size_t budget = kMaxChunksPerPump;
+  while (budget-- > 0) {
     const uint32_t room = tuh_cdc_write_available(idx);
     if (room == 0) break;
     size_t want = toDevice_.size();
@@ -344,8 +413,10 @@ void CdcHostBackend::pumpDevice() {
 
   // adapter → core0. Stopping when the ring is full is not a loss: the bytes
   // stay in TinyUSB's FIFO and, once that fills too, the bulk IN endpoint is
-  // simply not polled, which is how USB applies back-pressure.
-  while (true) {
+  // simply not polled, which is how USB applies back-pressure. Stopping when
+  // the budget runs out is the same: whatever is left is read next turn.
+  budget = kMaxChunksPerPump;
+  while (budget-- > 0) {
     const uint32_t avail = tuh_cdc_read_available(idx);
     if (avail == 0) break;
     size_t want = fromDevice_.space();

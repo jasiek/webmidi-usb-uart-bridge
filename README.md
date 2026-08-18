@@ -158,8 +158,8 @@ caveat there about what a loopback can and cannot prove.
 - **Phase 2 — Pico-PIO-USB CDC/ACM host: written, builds, not yet run on
   hardware.** `pio run -e pico_cdc`. The USB host stack runs on core1 and
   reaches the protocol engine on core0 through lock-free rings and a timed
-  mailbox (DECISIONS.md D8). ACM, FTDI, CP210x and CH34x adapters are covered
-  by TinyUSB's host CDC driver; PL2303 is not, in this version of it. Hot-plug
+  mailbox (DECISIONS.md D8). ACM, FTDI, CP210x, CH34x and PL2303 adapters are
+  all covered by TinyUSB's host CDC driver. Hot-plug
   is reported as `EVT_ATTACH`/`EVT_DETACH` and in `STATUS.present`; a detach faults the port
   rather than closing it quietly (D9). The engine's half of that is under test
   in `test/test_bridge` and `host/test/client.test.js`; **the USB host port

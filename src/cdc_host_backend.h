@@ -160,6 +160,10 @@ class CdcHostBackend : public Backend {
   static constexpr uint8_t kPhasePump = 3;     // pumpDevice()
   static constexpr uint8_t kPhaseIdle = 4;     // between turns
 
+  // A control transfer core1 started has finished. Called from TinyUSB's
+  // completion callback, which runs on core1 inside tuh_task().
+  void onXferComplete(uint32_t gen, bool ok);
+
   void setHostPhase(uint8_t phase) {
     core1Phase_.store(phase, std::memory_order_relaxed);
   }
@@ -203,8 +207,9 @@ class CdcHostBackend : public Backend {
   bool claimOp();              // core0: take the mailbox, or fail if it is busy
   bool runOp(Op op);           // core0: publish a claimed op and wait for it.
   void executeOp();            // core1: perform whatever core0 posted.
-  bool applyLineCoding();      // core1
-  bool applyControlLines();    // core1
+  bool startLineCoding();      // core1: post the request, do not wait for it
+  bool startControlLines();    // core1: ditto
+  void finishOp(bool ok);      // core1: release the mailbox back to core0
   void pumpDevice();           // core1: move bytes both ways
 
   // core1: publish an attach or a detach as one store. Bit 0 is the level and
@@ -231,6 +236,25 @@ class CdcHostBackend : public Backend {
   PortConfig pending_;
   uint8_t pendingFlush_ = 0;
   uint8_t pendingLines_ = 0;
+
+  // An outstanding control transfer. Core1 touches these only, from loop1()
+  // and from the completion callback, which is also core1 — so no atomics.
+  //
+  // The generation is what makes abandoning one safe. A transfer that answers
+  // after core1 has given up on it would otherwise complete whatever op the
+  // mailbox holds by then, which is not the op it belongs to; carrying the
+  // generation in user_data and checking it on the way back makes a late
+  // answer a no-op instead.
+  bool xferPending_ = false;
+  uint32_t xferGen_ = 0;
+  uint32_t xferStartedAt_ = 0;
+
+  // Core1's own patience, deliberately longer than core0's kOpTimeoutMs so
+  // that in the ordinary case core0 reports the failure first and core1 is
+  // only tidying up after it. Its job is not to make the caller wait less —
+  // it is to give the mailbox back, so the *next* op is not refused for ever
+  // by an op that is never coming home.
+  static constexpr uint32_t kXferTimeoutMs = 1500;
 
   SpscRing<kHostRingSlots> toDevice_;    // core0 produces, core1 consumes
   SpscRing<kHostRingSlots> fromDevice_;  // core1 produces, core0 consumes

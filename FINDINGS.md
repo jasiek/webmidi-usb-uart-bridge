@@ -245,6 +245,26 @@ next person does not rediscover them.
   Pico's VBUS pin is not a power budget for a downstream device; a far end
   that browns out part-way through enumeration presents exactly as this does,
   with the pull-up asserted, the reset accepted, and then silence.
+## Two TinyUSB versions in one project
+
+- **`pico` builds against a different TinyUSB from `pico_cdc`, and nothing says
+  so.** Naming Pico-PIO-USB in `lib_deps` makes the library dependency finder
+  resolve Adafruit TinyUSB from the *registry* for that environment, instead of
+  using the copy bundled with the core. So `pico` compiled 3.4.4 out of
+  `framework-arduinopico/libraries/` and `pico_cdc` compiled 3.7.7 out of
+  `.pio/libdeps/`, unpinned, for however long that had been true.
+- The two differ in exactly the places phase 2 depends on. In 3.4.4 the FTDI
+  driver's `set_line_coding`, `set_data_format` and async paths are `// TODO
+  not implemented yet` stubs that return false, and there is no PL2303 driver
+  at all. In 3.7.7 all of them exist. Reading the core's copy while the
+  registry's copy was being compiled produced two confident and wrong
+  conclusions — that FTDI could not be configured at all, and that a PL2303
+  adapter could never work.
+- The way to check which one is being built is the object file, not the source
+  tree: `find .pio/build/<env> -name 'cdc_host*.o'` names the library directory
+  it came from. `platformio.ini` now pins the version so this is a decision
+  rather than a download date.
+
 ## Phase 2 on hardware, first run
 
 - **The port works, and the adapter matters more than anything else.** An FTDI
@@ -282,14 +302,29 @@ next person does not rediscover them.
   gone rather than stalling the engine for a second per op — which turned a
   five-baud sweep from five seconds of dead air into an immediate honest
   failure. `hostPhase()` records which stage core1 was in when it stopped.
-- **The byte loss is not a hang and not the credit window.** 4096 bytes
-  written, `to_dev=4096`, and `from_dev` stops short — 3420, 3506, 3499 across
-  runs, consistently ~600 short at 9600 and 19200 but only 8 short at 38400,
-  which is the wrong way round for anything driven by throughput pressure.
-  Core1 keeps polling and the adapter simply stops returning bytes. Undiagnosed;
-  the FT232R's flow control and its FIFO behaviour on a TX/RX loop are the
-  next things to look at, and `lines=0x03` means DTR and RTS are both asserted
-  while CTS is floating.
+- **The stall had three causes, not one, and the phase marker walked through
+  them.** Each fix moved `core1 stopped in:` to the next one:
+  1. `execute_op` — the blocking control transfer. TinyUSB 3.7.7's
+     `tuh_cdc_set_line_coding()` finds no `set_line_coding` for FTDI and falls
+     through to setting baud and format as two separate transfers; with a null
+     callback each is a `tuh_control_xfer()` that spins with no timeout. Fixed
+     by passing a real completion callback, which takes the chained
+     non-blocking path instead. This is only possible on 3.7.7 — on the 3.4.4
+     the core bundles, the async path is an unimplemented stub.
+  2. `pump_device` — both transfer loops ran until their ring was empty, and
+     both rings are fed by the other core, so the producer can keep that false
+     indefinitely. Core1 then never returns to `loop1()` and never calls
+     `tuh_task()`. This is precisely the lesson phase 1 recorded about
+     `pumpUsbMidi` and bounded at 16 reads; the other pump never got it. Now
+     bounded at 8 chunks each way per turn.
+  3. `usb_task` — inside `tuh_task()` itself, which is where it still is. Not
+     ours to fix from here, and the reason a supervisory reset of core1 is
+     probably unavoidable.
+- With the first two fixed, all five bauds run to completion instead of taking
+  the backend down: 3491, 3566, 4070, 4073, 4091 of 4096 at 9600 through
+  115200. The shortfall shrinks as the baud rises, which looks like running out
+  of time rather than losing data — except that a 180 s timeout at 9600 still
+  stops at ~3494, so it is a genuine stall and not slowness. Still undiagnosed.
 
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
