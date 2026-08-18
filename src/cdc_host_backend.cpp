@@ -429,6 +429,9 @@ void CdcHostBackend::pumpDevice() {
     fromDevice_.write(buf, got);
     bytesFromDevice_ += got;
   }
+
+  hostTxSpace_ = tuh_cdc_write_available(idx);
+  hostRxAvail_ = tuh_cdc_read_available(idx);
 }
 
 // Core0 watches this for movement, not for a value: any change means core1

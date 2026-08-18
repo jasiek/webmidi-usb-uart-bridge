@@ -133,6 +133,16 @@ class CdcHostBackend : public Backend {
   uint32_t bytesToDevice() const { return bytesToDevice_; }
   uint32_t bytesFromDevice() const { return bytesFromDevice_; }
   uint32_t opTimeouts() const { return opTimeouts_; }
+
+  // Where the bytes are, when the count that left core0 and the count that
+  // came back disagree. Sampled by core1 at the end of each pump rather than
+  // called from core0: tuh_* is core1's, and asking the host stack a question
+  // from the wrong core is how this backend got its first wedge.
+  uint32_t hostTxSpace() const { return hostTxSpace_; }
+  uint32_t hostRxAvail() const { return hostRxAvail_; }
+  // Safe from either core by construction — see spsc_ring.h.
+  size_t toDeviceDepth() const { return toDevice_.size(); }
+  size_t fromDeviceDepth() const { return fromDevice_.size(); }
   bool clockOk() const { return clockOk_; }
 
   // Whether core1 is still going round its loop. Core1 can stop for good —
@@ -264,6 +274,8 @@ class CdcHostBackend : public Backend {
   uint32_t bytesToDevice_ = 0;
   uint32_t bytesFromDevice_ = 0;
   uint32_t deviceMounts_ = 0;
+  uint32_t hostTxSpace_ = 0;
+  uint32_t hostRxAvail_ = 0;
   uint16_t lastVid_ = 0;
   uint16_t lastPid_ = 0;
   // Bumped by core1 every time round loop1(). Core0 watches it for movement

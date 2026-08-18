@@ -83,6 +83,25 @@ first is done. When core1 stops:
 Confirmed end to end on hardware — acknowledged in 1 ms, board reset and came
 back reporting `boot=REBOOT-cmd`, with the loopback suite clean afterwards.
 
+**And confirmed against the real fault**, which is better evidence than the
+staged one. During the issue 3 work core1 wedged for real (`CORE1-STALLED`,
+`core1 stopped in: pump_device`, `host_tasks` frozen at 24889759 across seven
+consecutive samples). `REBOOT` recovered it over the still-live MIDI tunnel in
+1 ms, with no physical access. Note the port had to be left closed: `OPEN`
+fails with `ERR_BACKEND` on a dead backend, so a rescue path that opened one
+first would never reach the reboot. That `REBOOT` is legal with no port open
+(D15) is what made the rescue possible, and it was very nearly a nicety.
+
+**Limitation found doing it: the far end does not come back.** After the
+reboot core1 was healthy — `host_tasks` climbing, `op_timeouts=0` — but the
+FT232R stayed `attached=0 enum=0` indefinitely, with the bus levels unchanged
+at `bus=10`. A warm RP2040 reset does not cycle VBUS, so the adapter keeps the
+USB address it was given before the reset and never presents the fresh
+connect that TinyUSB enumerates on. Recovering the *bridge* therefore does not
+recover the *link*: a downstream replug is still needed. Worth fixing by
+forcing a port reset when a device is already present at startup, rather than
+waiting for an attach edge that has already happened.
+
 What is still owed here is the *in-place* recovery: a wedge costs a full reboot
 and everything buffered with it. That is a real cost, and if issue 1 is ever
 fixed upstream this issue mostly goes away with it.
@@ -182,13 +201,45 @@ TX/RX loop are what remain of the original candidate list. Device-side credit
 accounting — `toHost_` and `fromDevice_` in `cdc_host_backend` — is the new
 one, and is where the desk work above points.
 
-**The measurement still owed**, and it is unchanged: `from_dev` freezing
-*after* the client gives up is expected and proves nothing — the host stops
-granting credit, `toHost_` fills, `fromDevice_` fills, and `pumpDevice`
-correctly stops reading. What matters is whether `from_dev` is still advancing
-*during* the transfer. The one attempt to sample that was spoiled by the board
-stalling on issue 1 partway through, which is why issue 1 is a prerequisite
-rather than a parallel track.
+**The measurement was taken on 2026-08-18, and it clears our firmware.**
+
+Sampling once a second through a 9600-baud run (4096 bytes, 3472 returned):
+
+```
+to_dev=960  from_dev=564      to_dev=3840 from_dev=3047
+to_dev=1920 from_dev=1372     to_dev=4096 from_dev=3472   <- from_dev freezes here
+to_dev=2880 from_dev=2207     to_dev=4096 from_dev=3472   ... and never moves again
+```
+
+`from_dev` freezes at the instant `to_dev` completes, and roughly 25 seconds
+*before* the client's timeout expires — so this is not the client giving up and
+the back-pressure story is not what stops it.
+
+With the four buffers along the path instrumented, the state after the freeze
+is unambiguous:
+
+```
+to_dev_ring=0  from_dev_ring=0  tu_tx_space=128  tu_rx_avail=0
+```
+
+Both our rings empty, TinyUSB's TX FIFO empty (128 is its whole capacity) and
+its RX FIFO empty. Every byte was accepted by the USB host controller and
+handed to the adapter; fewer came back. **The loss is downstream of our USB
+host controller** — in the FT232R or the loopback wire — and not in the engine,
+the rings, the pumps, the credit windowing or the device stack.
+
+**It is not a large-payload overrun.** A payload-size sweep at 9600 loses bytes
+at every size: 128 → 122, 256 → 230. So "we firehose the adapter faster than
+its UART drains" does not survive contact either, at least not on its own.
+
+**Where to look next.** TinyUSB's FTDI receive path at `cdc_host.c:704-712`
+strips the FTDI's 2-byte status header from *the start of the transfer* rather
+than from each 64-byte packet in it, and discards the whole transfer when
+`xferred_bytes <= 2`. On a multi-packet IN transfer that mishandles every
+packet after the first. Stated as a candidate, not a diagnosis: it has not been
+confirmed, and the arithmetic has not been made to fit yet. The other honest
+possibility is that this adapter, or the short on it, is simply bad — which
+issue 4's cheap test would help settle.
 
 ---
 

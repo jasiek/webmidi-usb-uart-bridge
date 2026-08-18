@@ -196,6 +196,17 @@ void serviceDebug(uint32_t nowMs) {
         bridge::gCdcHost.outputLines(),
         bridge::gCdcHost.dpLevel() ? 1 : 0, bridge::gCdcHost.dmLevel() ? 1 : 0,
         bridge::gCdcHost.hostAlive(nowMs) ? "" : " CORE1-STALLED");
+    // Where the missing bytes are sitting, for OPEN-ISSUES 3: the four buffers
+    // between core0's ring and the adapter, so a shortfall can be attributed
+    // instead of guessed at.
+    if (SerialTinyUSB.availableForWrite() >= 80) {
+      SerialTinyUSB.printf(
+          "    buf: to_dev_ring=%u from_dev_ring=%u tu_tx_space=%lu tu_rx_avail=%lu\r\n",
+          static_cast<unsigned>(bridge::gCdcHost.toDeviceDepth()),
+          static_cast<unsigned>(bridge::gCdcHost.fromDeviceDepth()),
+          static_cast<unsigned long>(bridge::gCdcHost.hostTxSpace()),
+          static_cast<unsigned long>(bridge::gCdcHost.hostRxAvail()));
+    }
     if (!bridge::gCdcHost.hostAlive(nowMs) &&
         SerialTinyUSB.availableForWrite() >= 48) {
       SerialTinyUSB.printf(

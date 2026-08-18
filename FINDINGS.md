@@ -350,6 +350,21 @@ next person does not rediscover them.
   built on "restart the host stack" has to solve all four first; OPEN-ISSUES 2
   has the detail.
 
+- **A warm reset recovers the bridge but not the far end.** `REBOOT` brings
+  core1 back, but the downstream adapter stays unenumerated afterwards: an
+  RP2040 warm reset does not cycle VBUS, so the device keeps the USB address it
+  was assigned before the reset and never presents the connect edge TinyUSB
+  enumerates on. The bus levels look identical to a healthy attach, which makes
+  this easy to misread as a wiring fault. A replug fixes it.
+- **Instrument all four buffers, not the endpoints.** "Bytes went in and fewer
+  came out" has five possible homes on this backend — our two rings, TinyUSB's
+  two FIFOs, and the adapter. Printing all four at once
+  (`to_dev_ring / from_dev_ring / tu_tx_space / tu_rx_avail`) turned a
+  three-week-old open question into one measurement: all four empty means the
+  bytes really did leave, and the argument moves downstream of our code. Sample
+  them from core1, where the `tuh_*` calls belong; asking the host stack a
+  question from core0 is how this backend got its first wedge.
+
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs
