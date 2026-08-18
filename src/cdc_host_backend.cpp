@@ -254,6 +254,12 @@ void CdcHostBackend::executeOp() {
   switch (op) {
     case Op::Open:
       toDevice_.discard(toDevice_.size());
+      // The pace is a property of the line we just configured, so it is set
+      // here rather than read from shared state on every pump.
+      openCfg_ = pending_;
+      paceTokens_ = kPaceBurstBytes;
+      paceRem_ = 0;
+      paceLastUs_ = micros();
       if (mounted) {
         tuh_cdc_read_clear(idx);
         tuh_cdc_write_clear(idx);
@@ -374,6 +380,45 @@ bool CdcHostBackend::startControlLines() {
   return true;
 }
 
+// Bits on the wire per byte: start + data + parity + stop. This is what the
+// far end's UART actually spends, and using 10 for everything would under-pace
+// 7E2 by 20%.
+uint32_t CdcHostBackend::frameBits() const {
+  uint32_t bits = 1u + openCfg_.databits + openCfg_.stopbits;
+  if (openCfg_.parity != Parity::None) ++bits;
+  return bits;
+}
+
+// Credit the bucket with whatever the line could have transmitted since the
+// last call. The remainder is carried rather than discarded: at 9600 baud a
+// 4 microsecond pump turn earns 0.0038 of a byte, and throwing that away every
+// turn would pace the link at zero.
+void CdcHostBackend::refillPaceBudget() {
+  const uint32_t nowUs = micros();
+  const uint32_t elapsed = nowUs - paceLastUs_;  // wraps correctly
+  paceLastUs_ = nowUs;
+
+  const uint32_t bits = frameBits();
+  if (openCfg_.baud == 0 || bits == 0) {
+    paceTokens_ = kPaceBurstBytes;
+    return;
+  }
+
+  // (elapsed_us * baud) / (1e6 * bits), carrying the remainder. elapsed is
+  // bounded by the pump interval, so the multiply cannot overflow in practice;
+  // clamp it anyway, because a pump that has not run for a second should not
+  // be able to earn a burst it would then dump into the adapter.
+  const uint32_t capUs = 100000;
+  const uint32_t dt = elapsed > capUs ? capUs : elapsed;
+  const uint64_t num = static_cast<uint64_t>(dt) * openCfg_.baud + paceRem_;
+  const uint64_t den = static_cast<uint64_t>(1000000u) * bits;
+  const uint32_t earned = static_cast<uint32_t>(num / den);
+  paceRem_ = static_cast<uint32_t>(num % den);
+
+  paceTokens_ += earned;
+  if (paceTokens_ > kPaceBurstBytes) paceTokens_ = kPaceBurstBytes;
+}
+
 void CdcHostBackend::pumpDevice() {
   if (!present()) return;
   const uint8_t idx = cdcIdx_.load(std::memory_order_relaxed);
@@ -394,6 +439,16 @@ void CdcHostBackend::pumpDevice() {
   // 8 chunks is 512 bytes a turn, each way. At a quarter of a million turns a
   // second that is far more than the tunnel can carry, so the bound costs
   // nothing and only ever binds when something is wrong.
+  // Nothing between here and the far end's UART applies back-pressure for us.
+  // tuh_cdc_write() accepts at USB speed and tuh_cdc_write_available() reports
+  // space in TinyUSB's FIFO, not the adapter's — so at 9600 baud we can hand a
+  // 960-byte-per-second line several thousand bytes a second, its transmit
+  // buffer overruns and it drops bytes out of the middle of the stream.
+  // Measured: 653 of 4096 lost that way, one byte at a time. Phase 1 never had
+  // this because uart_is_writable() is real hardware back-pressure; the USB hop
+  // is what hides it. OPEN-ISSUES.md 3.
+  refillPaceBudget();
+
   size_t budget = kMaxChunksPerPump;
   while (budget-- > 0) {
     const uint32_t room = tuh_cdc_write_available(idx);
@@ -401,12 +456,17 @@ void CdcHostBackend::pumpDevice() {
     size_t want = toDevice_.size();
     if (want > room) want = room;
     if (want > kChunk) want = kChunk;
-    if (want == 0) break;
+    if (want > paceTokens_) want = paceTokens_;
+    if (want == 0) {
+      if (!toDevice_.empty()) ++paceDropped_;
+      break;
+    }
 
     const size_t got = toDevice_.peek(buf, want);
     const uint32_t wrote = tuh_cdc_write(idx, buf, got);
     if (wrote == 0) break;
     toDevice_.discard(wrote);
+    paceTokens_ -= wrote;
     bytesToDevice_ += wrote;
   }
   tuh_cdc_write_flush(idx);

@@ -140,6 +140,14 @@ class CdcHostBackend : public Backend {
   // from the wrong core is how this backend got its first wedge.
   uint32_t hostTxSpace() const { return hostTxSpace_; }
   uint32_t hostRxAvail() const { return hostRxAvail_; }
+  uint32_t paceStalls() const { return paceDropped_; }
+
+  // The adapter's transmit FIFO is the thing being protected, so the burst
+  // allowed after an idle period is sized to fit inside one. 64 is the FT232R's
+  // smaller (transmit) FIFO halved — small enough to be safe on anything with
+  // a 128-byte buffer, large enough that a full USB packet still goes out in
+  // one turn once tokens have accrued.
+  static constexpr uint32_t kPaceBurstBytes = 64;
   // Safe from either core by construction — see spsc_ring.h.
   size_t toDeviceDepth() const { return toDevice_.size(); }
   size_t fromDeviceDepth() const { return fromDevice_.size(); }
@@ -222,6 +230,12 @@ class CdcHostBackend : public Backend {
   void finishOp(bool ok);      // core1: release the mailbox back to core0
   void pumpDevice();           // core1: move bytes both ways
 
+  // How many bytes the far end's line can have swallowed since the last pump,
+  // and the bucket that meters them out. See pumpDevice() for why this is
+  // needed at all.
+  void refillPaceBudget();
+  uint32_t frameBits() const;
+
   // core1: publish an attach or a detach as one store. Bit 0 is the level and
   // the bits above it count the flips, so core0 can never read a level from
   // one transition and a count from another.
@@ -276,6 +290,13 @@ class CdcHostBackend : public Backend {
   uint32_t deviceMounts_ = 0;
   uint32_t hostTxSpace_ = 0;
   uint32_t hostRxAvail_ = 0;
+  uint32_t paceDropped_ = 0;   // pumps that had bytes but no budget
+
+  // Token bucket for the outbound pump, in bytes. core1 only.
+  uint32_t paceTokens_ = 0;
+  uint32_t paceLastUs_ = 0;
+  uint32_t paceRem_ = 0;       // sub-byte remainder, kept so slow bauds accrue
+  PortConfig openCfg_;         // what the port was actually opened with
   uint16_t lastVid_ = 0;
   uint16_t lastPid_ = 0;
   // Bumped by core1 every time round loop1(). Core0 watches it for movement

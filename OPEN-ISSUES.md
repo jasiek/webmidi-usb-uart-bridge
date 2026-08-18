@@ -292,12 +292,25 @@ claim came from reading 3.4.4 by mistake (issue 5) and has been retracted.
 Enumeration happens below the class drivers in any case, and enumeration is
 what is failing.
 
-**The FTDI does it too, and there is a deadlock in the library that explains
-why replugging never helps.** Observed 2026-08-18: after core1 wedged, the
-FT232R that had been working sat at `conn=1 fullspeed=1 susp=1` and never
-enumerated again, through a replug and through a reboot.
+**The FTDI does it too.** Observed 2026-08-18: after core1 wedged, the FT232R
+that had been working stopped enumerating and would not start again.
 
-Watching a live unplug/replug with the port already stuck:
+**There are two distinct stuck states, and only one of them is the deadlock
+below.** Both show `attached=0 enum=0` with core1 perfectly healthy, so the
+`susp` field is the only thing that tells them apart:
+
+- `conn=1 fullspeed=1 **susp=1**` — the library deadlock described below. The
+  port never got its bus reset, so it is not operating at all.
+- `conn=1 fullspeed=1 **susp=0**` — the port *is* operating, SOFs are going
+  out, and `susp=0` proves TinyUSB did drive a port reset to completion. So
+  enumeration was attempted and then quietly failed, with no mount callback and
+  no error. This is the signature this issue was originally filed with, it is
+  the state the bench was left in after the pacing build was flashed, and the
+  deadlock does **not** explain it. Undiagnosed.
+
+The deadlock, which was observed live and is certainly real:
+
+Watching a live unplug/replug with the port stuck in the `susp=1` state:
 
 | | `bus` | `conn` | `susp` |
 | --- | --- | --- | --- |

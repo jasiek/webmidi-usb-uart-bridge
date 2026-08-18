@@ -201,11 +201,13 @@ void serviceDebug(uint32_t nowMs) {
     // instead of guessed at.
     if (SerialTinyUSB.availableForWrite() >= 80) {
       SerialTinyUSB.printf(
-          "    buf: to_dev_ring=%u from_dev_ring=%u tu_tx_space=%lu tu_rx_avail=%lu\r\n",
+          "    buf: to_dev_ring=%u from_dev_ring=%u tu_tx_space=%lu tu_rx_avail=%lu"
+          " paced=%lu\r\n",
           static_cast<unsigned>(bridge::gCdcHost.toDeviceDepth()),
           static_cast<unsigned>(bridge::gCdcHost.fromDeviceDepth()),
           static_cast<unsigned long>(bridge::gCdcHost.hostTxSpace()),
-          static_cast<unsigned long>(bridge::gCdcHost.hostRxAvail()));
+          static_cast<unsigned long>(bridge::gCdcHost.hostRxAvail()),
+          static_cast<unsigned long>(bridge::gCdcHost.paceStalls()));
     }
     if (!bridge::gCdcHost.hostAlive(nowMs) &&
         SerialTinyUSB.availableForWrite() >= 48) {
