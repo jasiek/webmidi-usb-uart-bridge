@@ -344,7 +344,56 @@ void onControlXferDone(tuh_xfer_t* xfer) {
   gCdcHost.onXferComplete(static_cast<uint32_t>(xfer->user_data),
                           xfer->result == XFER_RESULT_SUCCESS);
 }
+
+// Exists so the latency request is not a blocking transfer. tuh_control_xfer()
+// with a null callback spins in tuh_task() with no timeout, which is how core1
+// was lost before; a callback that does nothing is the whole point.
+void onLatencyXferDone(tuh_xfer_t* xfer) { (void)xfer; }
 }  // namespace
+
+// The FT232R sends an IN packet either when it has 62 bytes of payload or when
+// its latency timer expires with something buffered. Every one of those packet
+// boundaries can lose bytes on this stack, so the timer's default of 16 ms —
+// 15.5 bytes at 9600 baud — perforates a slow stream: measured at 715 bytes
+// lost out of 4096, in 185 gaps whose spacing is a clean multiple of that
+// window. Fewer boundaries, less loss.
+//
+// TinyUSB has a `CFG_TUH_CDC_FTDI_LATENCY` for this and it cannot be used: the
+// code behind the #ifdef calls an undeclared function and does not compile
+// (cdc_host.c:1241). So the request goes out from here instead. It is the same
+// vendor request the library would have sent — bRequest 9, type 0x40, value in
+// milliseconds — and the same asynchronous shape as startLineCoding() below.
+//
+// Fire-and-forget on purpose. It does not use xferPending_/xferGen_, because
+// those belong to the op mailbox and this is not an op: core0 is not waiting on
+// it, nothing downstream depends on it, and an adapter that refuses it is no
+// worse off than one that was never asked. A null callback would be a blocking
+// transfer with no timeout, which is what took core1 down before (FINDINGS.md),
+// so it gets a real one that does nothing.
+void CdcHostBackend::startLatencyTimer(uint8_t idx) {
+  tuh_itf_info_t info;
+  if (!tuh_cdc_itf_get_info(idx, &info)) return;
+
+  uint16_t vid = 0, pid = 0;
+  if (!tuh_vid_pid_get(info.daddr, &vid, &pid)) return;
+  if (vid != 0x0403) return;  // FTDI only; the request is vendor-specific
+
+  static tusb_control_request_t setup;
+  setup.bmRequestType = 0x40;  // host-to-device, vendor, device
+  setup.bRequest = 9;          // FTDI_SIO_SET_LATENCY_TIMER
+  setup.wValue = kFtdiLatencyMs;
+  setup.wIndex = 0;            // channel; 0 on a single-port FT232R
+  setup.wLength = 0;
+
+  tuh_xfer_t xfer = {};
+  xfer.daddr = info.daddr;
+  xfer.ep_addr = 0;
+  xfer.setup = &setup;
+  xfer.buffer = nullptr;
+  xfer.complete_cb = onLatencyXferDone;
+  xfer.user_data = 0;
+  (void)tuh_control_xfer(&xfer);
+}
 
 bool CdcHostBackend::startLineCoding() {
   gLineCoding.bit_rate = pending_.baud;
@@ -543,6 +592,7 @@ void CdcHostBackend::onMount(uint8_t idx) {
   if (tuh_cdc_get_rts(idx)) seeded |= kLineRts;
   outLines_.store(seeded, std::memory_order_relaxed);
 
+  startLatencyTimer(idx);
   setPresent(true);
 }
 

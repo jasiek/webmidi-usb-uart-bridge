@@ -148,6 +148,23 @@ class CdcHostBackend : public Backend {
   // a 128-byte buffer, large enough that a full USB packet still goes out in
   // one turn once tokens have accrued.
   static constexpr uint32_t kPaceBurstBytes = 64;
+
+  // Milliseconds the adapter may hold a partial buffer before sending it up.
+  //
+  // Counter-intuitively this wants to be LARGE. Bytes are lost at IN-packet
+  // boundaries, so the fewer boundaries the better, and the timer is what
+  // creates them on a slow line. The FT232R's own default of 16 ms is 15.5
+  // bytes at 9600 baud and costs 715 of every 4096; at 100 ms the same run
+  // loses 1. Raising it is the fix, not a tuning knob turned the usual way.
+  //
+  // The cost is read latency: this is the longest a lone byte can sit in the
+  // adapter before we see it. 100 ms is the value that was actually measured,
+  // so it is the value used, and it is provisional — the loss-against-latency
+  // sweep that would justify a smaller one has not been run. Note the adapter
+  // also sends as soon as it has 62 bytes of payload, which at 9600 baud is
+  // 64 ms, so above roughly that the timer stops being what triggers packets
+  // at all. DECISIONS.md D16, OPEN-ISSUES.md 3.
+  static constexpr uint8_t kFtdiLatencyMs = 100;
   // Safe from either core by construction — see spsc_ring.h.
   size_t toDeviceDepth() const { return toDevice_.size(); }
   size_t fromDeviceDepth() const { return fromDevice_.size(); }
@@ -225,6 +242,11 @@ class CdcHostBackend : public Backend {
   bool claimOp();              // core0: take the mailbox, or fail if it is busy
   bool runOp(Op op);           // core0: publish a claimed op and wait for it.
   void executeOp();            // core1: perform whatever core0 posted.
+  // core1: tell an FTDI adapter how long to sit on a partial buffer before
+  // sending it upstream. Fire-and-forget — see the definition for why this is
+  // ours to send rather than TinyUSB's.
+  void startLatencyTimer(uint8_t idx);
+
   bool startLineCoding();      // core1: post the request, do not wait for it
   bool startControlLines();    // core1: ditto
   void finishOp(bool ok);      // core1: release the mailbox back to core0

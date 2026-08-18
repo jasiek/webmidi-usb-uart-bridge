@@ -149,9 +149,13 @@ mean something else.
 
 ---
 
-## 3. The loopback loses bytes — diagnosed, fix not yet landed
+## 3. ~~The loopback loses bytes~~ — fixed, with a workaround
 
-**Severity: high. Undiagnosed.**
+**Severity: was high. Fixed 2026-08-18 by DECISIONS.md D16 — the bridge now
+sets the FT232R's latency timer to 100 ms on mount, and all five bauds return
+all 4096 bytes, twice in a row. Kept in full because the fix is a workaround
+for a defect below us, and because three wrong theories are recorded here that
+are worth not repeating.**
 
 With both stalls fixed, all five bauds run to completion but none returns the
 full payload:

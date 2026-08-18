@@ -397,6 +397,11 @@ next person does not rediscover them.
   different wrong theories for weeks. The gap *spacing* named the mechanism in
   one run, and the only reason it was available is that the analysis aligns the
   returned stream against the sent one instead of counting it.
+- **Fixed by sending the request ourselves** (DECISIONS.md D16): five bauds,
+  4096 bytes each, all complete, twice in a row. The knob goes the opposite way
+  to instinct — *raising* the latency timer is what removes the loss, because
+  the loss is per packet boundary and the timer is what creates boundaries on a
+  slow line.
 - **TinyUSB's `CFG_TUH_CDC_FTDI_LATENCY` does not compile.** `cdc_host.c:1241`
   calls an undeclared `ftdi_process_config` and declares a variable inside a
   `switch` case without braces. It is dead code behind an `#ifdef` that nobody

@@ -453,3 +453,46 @@ PROTOCOL.md §5.10 says so rather than leaving a host to find out. It also does
 not *fix* OPEN-ISSUES 1 — a wedge still costs a reboot. It removes the need for
 physical access, which for a device driven from a phone is the difference
 between a fault and a brick.
+
+### D16. The bridge sets the FTDI's latency timer, and sets it high
+
+**Question.** The FT232R loses bytes at every USB IN-packet boundary on this
+stack — 715 of 4096 at 9600 baud, in 185 gaps whose spacing is a clean multiple
+of the adapter's 16 ms latency timer. The timer is what creates those
+boundaries on a slow line. What should the bridge do about it?
+
+**Decision.** Send `FTDI_SIO_SET_LATENCY_TIMER` ourselves on mount, with a
+value of **100 ms**, from `CdcHostBackend::startLatencyTimer()`.
+
+**Why we send it rather than TinyUSB.** TinyUSB has `CFG_TUH_CDC_FTDI_LATENCY`
+for exactly this and it cannot be used: the code behind the `#ifdef` calls an
+undeclared `ftdi_process_config` and declares a variable inside a `switch` case
+without braces, so defining the macro breaks the build (`cdc_host.c:1241`). It
+is dead code nobody has enabled. Sending the vendor request from our own
+backend needs no patched library and no build flag, and it is the same
+asynchronous shape as the line-coding transfer the backend already does.
+
+**Why high, when every instinct says low.** This is a latency knob turned the
+wrong way on purpose. Bytes are lost *per packet boundary*, so fewer boundaries
+means less loss, and on a slow line the timer is what manufactures them. At
+9600 baud the default 16 ms is one boundary every 15.5 bytes; at 100 ms the
+same transfer loses 1 byte instead of 715. The adapter also sends as soon as it
+has 62 bytes of payload — 64 ms at 9600 — so above roughly that the timer stops
+being the trigger at all and raising it further buys nothing.
+
+**Cost, stated plainly.** This is the longest a lone byte can sit inside the
+adapter before the bridge sees it. On a quiet line that is a real delay, and
+100 ms would be noticeable to anyone typing at a terminal through the tunnel.
+It is used because it is the value that was measured; the loss-against-latency
+sweep that would justify something smaller has not been run, and until it has,
+picking a smaller number would be a guess dressed up as a decision. Recorded as
+provisional for that reason.
+
+**And it is a workaround.** The per-boundary loss is a defect in the stack
+below us, not something a timer value fixes — it makes it rare rather than
+absent. The right repair is upstream, in whatever drops bytes at packet
+boundaries; this buys a working phase 2 in the meantime and says so.
+
+**Evidence.** Five bauds, 4096 bytes each, all returning complete, twice in a
+row — against 3491 / 3566 / 4070 / 4073 / 4091 before. Confirmed independently
+first with a patched library and then with this implementation.
