@@ -11,6 +11,7 @@ import {
   Cmd,
   CREDIT_IDLE_MS,
   Err,
+  Evt,
   MAX_DATA_RAW,
   PortState,
   RX_BUFFER_SIZE,
@@ -27,7 +28,8 @@ const RING_CAPACITY = 4095; // matches Bridge::kBufferSlots - 1
 export class FakeDevice {
   /**
    * @param {{rxBuffer?: number, maxRaw?: number, maxBaud?: number,
-   *          baudLimited?: boolean, latencyMs?: number}} [options]
+   *          baudLimited?: boolean, latencyMs?: number,
+   *          hotplug?: boolean}} [options]
    */
   constructor(options = {}) {
     this.rxBuffer = options.rxBuffer ?? RX_BUFFER_SIZE;
@@ -36,6 +38,10 @@ export class FakeDevice {
     // Off by default: tests want speed, bin/loopback.js --fake wants realism.
     this.baudLimited = options.baudLimited ?? false;
     this.latencyMs = options.latencyMs ?? 0;
+    // Models the phase 2 backend instead of the hardware UART: a far end that
+    // can be unplugged, driven from the test with attach()/detach(). §5.8.
+    this.hotplug = options.hotplug ?? false;
+    this.present = true;
 
     this.handler = null;
     this.state = PortState.CLOSED;
@@ -105,7 +111,16 @@ export class FakeDevice {
     if (parsed.status !== ParseStatus.OK) return; // not ours
 
     const { cmd, cursor } = parsed;
-    const alwaysLegal = [Cmd.HELLO, Cmd.RESET, Cmd.OPEN, Cmd.PING, Cmd.GET_STATUS];
+    // CREDIT included: the device goes on delivering what it received before
+    // the port closed, and that delivery is credit-paced. PROTOCOL.md §4.2.
+    const alwaysLegal = [
+      Cmd.HELLO,
+      Cmd.RESET,
+      Cmd.OPEN,
+      Cmd.PING,
+      Cmd.GET_STATUS,
+      Cmd.CREDIT,
+    ];
     if (this.state !== PortState.OPEN && !alwaysLegal.includes(cmd)) {
       return this.#error(Err.NOT_OPEN);
     }
@@ -121,8 +136,12 @@ export class FakeDevice {
             .u7(0)
             .u7(1)
             .u7(0)
-            .u7(BackendId.HARDWARE_UART)
-            .u14(Cap.BREAK | Cap.FLOW_RTSCTS)
+            .u7(this.hotplug ? BackendId.PIO_USB_CDC : BackendId.HARDWARE_UART)
+            .u14(
+              this.hotplug
+                ? Cap.DTR | Cap.RTS | Cap.HOTPLUG
+                : Cap.BREAK | Cap.FLOW_RTSCTS,
+            )
             .u14(this.maxRaw)
             .u14(this.rxBuffer)
             .u32(this.maxBaud)
@@ -239,25 +258,55 @@ export class FakeDevice {
         .u21(this.rxCount)
         .u21(this.txCount)
         .u14(this.sendCredit)
+        .u7(this.present ? 1 : 0)
         .build(),
     );
   }
 
+  // ---- hot-plug, driven by the test ---------------------------------------
+
+  /** Pulls the far end out from under an open port. §5.8. */
+  detach() {
+    if (!this.hotplug || !this.present) return;
+    this.present = false;
+    if (this.state === PortState.OPEN) {
+      // Deliberately not clearing toHost: bytes already received stay
+      // deliverable, exactly as in Bridge::pumpPresence.
+      this.toBackend = [];
+      this.state = PortState.FAULT;
+    }
+    this.#emit(new FrameBuilder(Rsp.EVENT).u7(Evt.DETACH).u7(BackendId.PIO_USB_CDC).build());
+    this.#pump();
+  }
+
+  /** Plugs one back in. Does not open a port — that is the host's move. */
+  attach() {
+    if (!this.hotplug || this.present) return;
+    this.present = true;
+    if (this.state === PortState.FAULT) this.state = PortState.CLOSED;
+    this.#emit(new FrameBuilder(Rsp.EVENT).u7(Evt.ATTACH).u7(BackendId.PIO_USB_CDC).build());
+  }
+
   /** Moves bytes across the looped-back wire, then out to the host. */
   #pump() {
-    if (this.state !== PortState.OPEN) return;
+    if (this.state === PortState.OPEN) {
+      // TX is jumpered to RX: everything written comes straight back.
+      const budget = this.baudLimited ? this.#byteBudget() : this.toBackend.length;
+      const moved = this.toBackend.splice(0, budget);
+      if (moved.length > 0) {
+        this.txCount += moved.length;
+        this.rxCount += moved.length;
+        this.toHost.push(...moved);
+        this.freed += moved.length;
+      }
 
-    // TX is jumpered to RX: everything written comes straight back.
-    const budget = this.baudLimited ? this.#byteBudget() : this.toBackend.length;
-    const moved = this.toBackend.splice(0, budget);
-    if (moved.length > 0) {
-      this.txCount += moved.length;
-      this.rxCount += moved.length;
-      this.toHost.push(...moved);
-      this.freed += moved.length;
+      this.#maybeReturnCredit();
     }
 
-    this.#maybeReturnCredit();
+    // Outside the state check, mirroring Bridge::poll: bytes that reached
+    // toHost while the port was open are still deliverable after a CLOSE or a
+    // detach, and the host keeps answering with CREDIT to pace them.
+    // PROTOCOL.md §5.9. OPEN and RESET are what clear them.
     this.#drainToHost();
 
     // If the wire throttled us, come back for the rest.

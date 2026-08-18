@@ -6,9 +6,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BridgeClient, ProtocolError } from '../src/client.js';
-import { Cmd, Err, MAX_DATA_RAW, Parity, PortState, Rsp } from '../src/constants.js';
+import {
+  BackendId,
+  Cap,
+  Cmd,
+  Err,
+  MAX_DATA_RAW,
+  Parity,
+  PortState,
+  Rsp,
+} from '../src/constants.js';
 import { FakeDevice } from '../src/fake-device.js';
-import { ParseStatus, parseFrame } from '../src/frame.js';
+import { FrameBuilder, ParseStatus, parseFrame } from '../src/frame.js';
 
 function makeRandom(seed = 0xbadc0de) {
   let state = seed >>> 0;
@@ -298,5 +307,186 @@ test('a bulk transfer arrives intact and in order', async () => {
 
   assert.deepEqual(back, payload);
   assert.deepEqual(warnings, [], `unexpected warnings: ${warnings.join('; ')}`);
+  client.destroy();
+});
+
+// ---- hot-plug (PROTOCOL.md §5.8) -------------------------------------------
+
+test('a non-hotplug device always reads as attached', async () => {
+  const device = new FakeDevice();
+  const client = new BridgeClient(device);
+
+  const info = await client.hello();
+  assert.equal(info.caps & Cap.HOTPLUG, 0);
+  const status = await client.getStatus();
+  assert.equal(status.present, true);
+  assert.equal(client.attached, true);
+
+  // And waiting for an attach on such a device is a no-op, not a 30 s stall.
+  await client.waitForAttach(50);
+  client.destroy();
+});
+
+test('detach faults the port and fails the writes waiting on it', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  const detached = new Promise((resolve) => client.once('detach', resolve));
+  // No credit was granted, so this write is parked waiting for some — exactly
+  // the case that would otherwise hang for ever once the far end is gone.
+  client.credit = 0;
+  const parked = client.write(Uint8Array.from([1, 2, 3]));
+
+  device.detach();
+  const arg = await detached;
+
+  assert.equal(arg, BackendId.PIO_USB_CDC);
+  assert.equal(client.attached, false);
+  assert.equal(client.state, PortState.FAULT);
+  await assert.rejects(parked, (e) => e instanceof ProtocolError && e.code === Err.BACKEND);
+  client.destroy();
+});
+
+test('bytes received before a detach still reach the host', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  const payload = Uint8Array.from([0x00, 0x7f, 0x80, 0xff]);
+  await client.write(payload);
+  // Pulled out in the same breath, before the device has framed them up.
+  device.detach();
+
+  const back = await client.readExactly(payload.length, 2000);
+  assert.deepEqual(back, payload);
+  client.destroy();
+});
+
+test('reattaching clears the fault and the port can be reopened', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+
+  device.detach();
+  await new Promise((resolve) => client.once('detach', resolve));
+
+  const attached = new Promise((resolve) => client.once('attach', resolve));
+  device.attach();
+  await attached;
+  assert.equal(client.attached, true);
+
+  const status = await client.open({ baud: 115200 });
+  assert.equal(status.state, PortState.OPEN);
+  assert.equal(status.present, true);
+
+  const payload = Uint8Array.from([0xde, 0xad, 0xbe, 0xef]);
+  await client.write(payload);
+  assert.deepEqual(await client.readExactly(payload.length, 2000), payload);
+  client.destroy();
+});
+
+test('re-attaching clears the fault the detach left on the client', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.open({ baud: 115200 });
+  client.on('error', () => {}); // the detach fails a write; not what is under test
+
+  device.detach();
+  await new Promise((resolve) => client.once('detach', resolve));
+  assert.equal(client.state, PortState.FAULT);
+
+  const attached = new Promise((resolve) => client.once('attach', resolve));
+  device.attach();
+  await attached;
+
+  // The device cleared its own fault on the attach (§5.8); a client still
+  // reading FAULT would refuse writes over a fault that is finished, and
+  // disagree with the very device it is talking to.
+  assert.equal(client.state, PortState.CLOSED, 'client kept a stale fault');
+  const status = await client.getStatus();
+  assert.equal(status.state, PortState.CLOSED);
+  assert.equal(client.state, PortState.CLOSED);
+  client.destroy();
+});
+
+// PROTOCOL.md §5.9: a device goes on delivering what it received before the
+// port closed, so a DATA frame from the old session can still be on the wire
+// when OPEN is sent. SysEx is ordered, so everything ahead of the STATUS reply
+// belongs to the old session — the client must not count those bytes against
+// the new one, which is what resetting its session before sending OPEN did.
+test('the previous session tail does not leak past an open', async () => {
+  let deliver = () => {};
+  const info = new FrameBuilder(Rsp.INFO)
+    .u7(1).u7(0).u7(1).u7(0)
+    .u7(BackendId.HARDWARE_UART)
+    .u14(0)
+    .u14(MAX_DATA_RAW)
+    .u14(2048)
+    .u32(921600)
+    .build();
+  const status = () =>
+    new FrameBuilder(Rsp.STATUS)
+      .u7(PortState.OPEN).u7(0).u7(0).u7(0)
+      .u21(0).u21(0).u14(2048).u7(1)
+      .build();
+
+  let staleSeq = null;
+  const transport = {
+    send(msg) {
+      const parsed = parseFrame(msg);
+      if (parsed.status !== ParseStatus.OK) return;
+      if (parsed.cmd === Cmd.HELLO) deliver(info);
+      if (parsed.cmd === Cmd.OPEN) {
+        // The tail of whatever session was running, then the reply to OPEN.
+        if (staleSeq !== null) {
+          deliver(
+            new FrameBuilder(Rsp.DATA)
+              .u7(staleSeq)
+              .packed(Uint8Array.from([0xde, 0xad, 0xbe, 0xef]))
+              .build(),
+          );
+        }
+        deliver(status());
+      }
+    },
+    onSysEx(cb) {
+      deliver = cb;
+    },
+    close() {},
+  };
+
+  const client = new BridgeClient(transport);
+  const warnings = [];
+  client.on('warning', (w) => warnings.push(w));
+
+  await client.open();
+  // One frame of a real session, so the old session's next sequence is not 0
+  // and a mis-attributed tail would be visible as a gap.
+  deliver(new FrameBuilder(Rsp.DATA).u7(0).packed(Uint8Array.from([1, 2, 3])).build());
+  assert.equal(client.available, 3);
+  client.read();
+
+  staleSeq = 1;
+  await client.open();
+
+  assert.deepEqual(warnings, [], `unexpected warnings: ${warnings.join('; ')}`);
+  assert.equal(client.available, 0, 'stale bytes were carried into the new session');
+  client.destroy();
+});
+
+test('waitForAttach returns once something is plugged in', async () => {
+  const device = new FakeDevice({ hotplug: true });
+  const client = new BridgeClient(device);
+  await client.hello();
+
+  // Nothing attached when the host arrives: no EVT_ATTACH was ever sent to it,
+  // so the answer has to come from STATUS.
+  device.present = false;
+  const waiting = client.waitForAttach(2000);
+  setTimeout(() => device.attach(), 20);
+
+  await waiting;
+  assert.equal(client.attached, true);
   client.destroy();
 });

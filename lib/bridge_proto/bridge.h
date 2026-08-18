@@ -72,6 +72,9 @@ class Bridge {
   void pumpToBackend();
   void pumpFromBackend();
   void pumpLines();
+  void pumpPresence();
+  void applyPresence(bool present);
+  void queuePresence(Evt evt);
 
   void resetSession(uint32_t nowMs);
 
@@ -97,6 +100,15 @@ class Bridge {
   uint16_t hostMaxRaw_ = kMaxDataRaw;
 
   uint8_t lastInputLines_ = 0;
+  bool lastPresent_ = true;
+  uint32_t lastPresenceChanges_ = 0;
+  // Attach/detach events built but not yet on the wire, oldest first. Two
+  // slots, which is provably enough: what is queued always alternates and
+  // always ends at the presence we last observed, so the newest two carry both
+  // things a host acts on — that its port faulted, and whether there is one to
+  // open now. A third pushes the oldest out rather than being dropped itself.
+  Evt presenceQueue_[2] = {Evt::Attach, Evt::Attach};
+  uint8_t presenceQueued_ = 0;
   uint8_t errFlags_ = 0;
   uint32_t rxCount_ = 0;
   uint32_t txCount_ = 0;

@@ -24,6 +24,30 @@ class Backend {
   virtual void close() = 0;
   virtual bool isOpen() const = 0;
 
+  // Whether a far end physically exists right now, independent of whether a
+  // port is open on it. A soldered-down UART has no way to tell and no reason
+  // to care, so the default is "always there"; the PIO-USB host backend
+  // reports device attach and detach through it, and the engine turns the
+  // transitions into EVT_ATTACH / EVT_DETACH. Only meaningful when caps()
+  // advertises kCapHotplug.
+  virtual bool present() const { return true; }
+
+  // The same answer plus its history, in one word: bit 0 is `present()`, and
+  // the bits above it count how many times that has flipped since boot.
+  //
+  // The count exists because the level alone cannot answer "did anything
+  // change?". A device unplugged and replaced between two polls reads
+  // identically both times, while the port left behind now points at a
+  // re-enumerated adapter that TinyUSB has already reset to its own defaults —
+  // 115200 8N1, DTR and RTS asserted — and not at the one the host opened.
+  // Treating that as "no change" leaves the host talking to a stranger.
+  //
+  // One word rather than two accessors so that a reader gets a level and a
+  // count that agree with each other; the backend that has both writes them
+  // with a single atomic store. The default is for a far end that cannot be
+  // unplugged: attached, and never having changed.
+  virtual uint32_t presence() const { return present() ? 1u : 0u; }
+
   // Bytes that write() would accept right now.
   virtual size_t writable() const = 0;
   // Returns how many bytes were accepted; may be less than n.

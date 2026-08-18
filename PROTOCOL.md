@@ -120,8 +120,13 @@ host→device commands are `0x01–0x3F`, device→host are `0x41–0x7F`.
 | 0x4E | `ERROR`   | `u7` code, `u7` detail (§5.5)               |
 | 0x4F | `EVENT`   | `u7` event, `u7` arg (§5.6)                 |
 
-`RESET` and `HELLO` are always legal. Any other host→device command received
-while the port is closed is answered with `ERROR(ERR_NOT_OPEN)`.
+`HELLO`, `OPEN`, `RESET`, `PING`, `GET_STATUS` and `CREDIT` are legal whether
+or not a port is open. Any other host→device command received while the port
+is closed is answered with `ERROR(ERR_NOT_OPEN)`.
+
+`CREDIT` is on that list because a device goes on delivering bytes it received
+before the port closed (§5.9), and that delivery is credit-paced like any
+other. A `CREDIT` with no port open grants a window and does nothing else.
 
 ## 5. Payload formats
 
@@ -192,6 +197,12 @@ populated.
 | `rx_count`  | `u21` | bytes received from the far end since `OPEN`  |
 | `tx_count`  | `u21` | bytes sent to the far end since `OPEN`        |
 | `credit`    | `u14` | credit the device currently has for host→device data |
+| `present`   | `u7`  | 1 if a far end is attached, 0 if not (§5.8)   |
+
+`present` was added after the first release. A host that finds the payload ends
+before it must treat the far end as attached: that is the correct answer for
+every backend that cannot be unplugged, which is the only kind that existed
+when the field did not.
 
 ### 5.5 Error codes
 
@@ -231,6 +242,56 @@ populated.
 | 6   | RI readable                      |
 | 7   | hardware RTS/CTS flow control    |
 | 8   | hot-plug (`EVT_ATTACH`/`DETACH`) |
+
+### 5.8 Hot-plug
+
+A backend whose far end can be physically removed — the PIO-USB CDC host, and
+nothing else so far — sets capability bit 8. Such a device:
+
+- emits `EVT_ATTACH` when a far end appears and `EVT_DETACH` when one goes
+  away, each carrying the backend id as its argument;
+- reports the current answer in `STATUS.present`, so a host that connects
+  while a device is already attached does not have to infer it from silence;
+- on detach, closes the port, discards anything still queued toward the far
+  end, and moves to `state` = fault. Bytes already received from the far end
+  are still delivered — a detach does not un-receive them.
+
+Attaching does **not** open a port. It means there is one to open: the host
+must send `OPEN` as it would have on connecting, which is also what re-arms
+the port after the fault a detach leaves behind.
+
+A far end that is removed and replaced faster than the device notices — both
+transitions falling between two of its polls — is still reported as
+`EVT_DETACH` followed by `EVT_ATTACH`, and still faults the port. The device
+that is there afterwards is not the one the port was opened on, however
+briefly it was gone, and the host has to `OPEN` again to know what it is
+talking to. A device that flaps repeatedly while the host is not reading may
+have the middle of the sequence collapsed; what a host is guaranteed is that
+the last event it receives matches the current answer in `STATUS.present`, and
+that a detach it needs to act on is never silently swallowed by a later
+attach.
+
+A device that does not set bit 8 never emits either event and always reports
+`present` = 1.
+
+### 5.9 Delivery after the port closes
+
+Bytes the device received from the far end while the port was open are
+delivered even if the port has closed or faulted in the meantime. `CLOSE` and
+`EVT_DETACH` say the far end is no longer reachable; they do not un-receive
+what already arrived, and a serial tunnel that drops the tail of a transfer
+because the cable was pulled a millisecond later is losing data silently.
+
+So after a `CLOSE` or an `EVT_DETACH` a host may still receive `DATA`, and
+must keep answering with `CREDIT` — which is why §4.2 leaves `CREDIT` legal
+with no port open. Sequence numbers continue from where the session left off;
+they restart only at `OPEN` and `RESET`.
+
+`OPEN` and `RESET` are the boundary, and they are hard: both discard whatever
+is still buffered *and* whatever has been framed but not yet transmitted, so
+nothing from the old session can arrive numbered for the new one. A host that
+wants the tail must read it before reopening. A device that has nothing left
+to say emits nothing, so a host that does not care can simply reopen.
 
 ## 6. Flow control
 

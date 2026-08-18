@@ -39,8 +39,19 @@ line driving GPIO1. Connecting a 5 V TX line directly will damage the pin.
 
 ## Phase 2 — Pico-PIO-USB host
 
-Not yet implemented in firmware; recorded here so the board can be built once.
-See DECISIONS.md D1 for the phasing.
+Implemented in firmware as `pio run -e pico_cdc`; **not yet run against a real
+port**, because building one needs the parts below. See DECISIONS.md D1 for the
+phasing and D8 for how the firmware is structured around it.
+
+The pin pair is a build setting, not a hard-coded constant: `-DBRIDGE_PIO_USB_DP=16`
+names the GPIO the socket's D+ reaches, and D− is the next GPIO up.
+
+If a board comes out with the two crossed, `-DBRIDGE_PIO_USB_SWAP` puts D− on
+the GPIO *below* D+ instead — the library supports either order
+(`PIO_USB_PINOUT_DMDP`), so it is a rebuild rather than a rework. It is not the
+default and should not become one: the table below is the wiring this project
+documents, and a firmware that silently accommodates a crossed pair is a
+firmware that hides one. Use it to confirm a diagnosis, then fix the wire.
 
 Pico-PIO-USB bit-bangs a USB host port using PIO. Its constraints are specific
 and unforgiving:
@@ -48,9 +59,10 @@ and unforgiving:
 - **D+ and D− must be consecutive GPIOs**, D+ on the lower number. GPIO0/1 are
   taken by the UART above, so use **D+ = GPIO16, D− = GPIO17**.
 - **The system clock must be a multiple of 12 MHz.** The Pico's default
-  125 MHz is *not*, and USB will not enumerate on it. Call
-  `set_sys_clock_khz(120000, true)` before starting the stack — and note that
-  this changes UART divisors, so the UART must be reconfigured afterwards.
+  125 MHz is *not*, and USB will not enumerate on it. The `pico_cdc`
+  environment sets `board_build.f_cpu = 120000000L`, which the core applies
+  before any peripheral is configured — doing it from `setup()` instead is too
+  late, because the UART divisors have already been computed against 125 MHz.
 - 22–27 Ω series resistors on D+ and D−, close to the RP2040.
 - 15 kΩ pull-downs to ground on both D+ and D−, which is what makes the port a
   host and lets device attach/detach be detected.
@@ -64,6 +76,17 @@ and unforgiving:
 | 22       | GPIO17 | USB D− | 27 Ω series, 15 kΩ to GND                |
 | 40       | VBUS   | +5 V   | to the downstream port's VBUS            |
 | 38       | GND    | GND    | to the downstream port's GND             |
+
+### Loopback, phase 2
+
+Same idea as the jumper above, one level further out: plug a USB serial adapter
+into the host port and short **its** TX to **its** RX. `npm run loopback` then
+tests the whole path — MIDI in, SysEx decode, core0 ring, core1, USB host, the
+adapter's UART, and all the way back.
+
+Two adapters wired TX↔RX to each other is the better rig, because it is the one
+that can prove the top end: a single looped adapter cannot send faster than it
+is sent to, which is the limitation DECISIONS.md D5 records for phase 1.
 
 ## Power, and the iOS case
 

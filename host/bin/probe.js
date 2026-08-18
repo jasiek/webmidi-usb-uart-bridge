@@ -54,6 +54,11 @@ try {
 
   const status = await client.getStatus();
   console.log(`port state    ${['closed', 'open', 'fault'][status.state] ?? status.state}`);
+  if (info.caps & Cap.HOTPLUG) {
+    // The first question on a host-port build, and the one the LED can only
+    // hint at: did the adapter downstream enumerate?
+    console.log(`far end       ${status.present ? 'attached' : 'nothing attached'}`);
+  }
   console.log('\ndevice is alive and speaking the protocol');
 } catch (error) {
   console.error(`\nfailed: ${error.message}`);

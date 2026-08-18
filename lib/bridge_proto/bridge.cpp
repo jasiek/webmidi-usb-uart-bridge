@@ -6,6 +6,14 @@ void Bridge::begin(uint32_t nowMs) {
   nowMs_ = nowMs;
   resetSession(nowMs);
   state_ = PortState::Closed;
+  // Sampled rather than assumed, so a device already attached at boot is not
+  // announced as an attach to a host that was not there to miss it. The change
+  // count is sampled with it for the same reason: whatever happened before we
+  // were running is not news.
+  const uint32_t presence = backend_.presence();
+  lastPresent_ = (presence & 1u) != 0;
+  lastPresenceChanges_ = presence >> 1;
+  presenceQueued_ = 0;
 }
 
 void Bridge::resetSession(uint32_t nowMs) {
@@ -42,9 +50,17 @@ void Bridge::onSysEx(const uint8_t* msg, size_t n, uint32_t nowMs) {
 
   const Cmd cmd = static_cast<Cmd>(r.cmd());
 
-  // HELLO and RESET are legal at any time; everything else needs a port.
+  // Legal with no port: the handshake, the two that ask about or change the
+  // port's existence, and CREDIT. CREDIT belongs on the list because the
+  // device goes on delivering what it received before a CLOSE or a detach
+  // (poll(), below), and that delivery is credit-paced like any other — a
+  // closed port that answered ERR_NOT_OPEN would strand everything past the
+  // host's opening window, and the spurious error would reject whatever
+  // unrelated request the host had in flight. It grants a window; it cannot
+  // do anything to a port that is not there. PROTOCOL.md §4.2.
   if (state_ != PortState::Open && cmd != Cmd::Hello && cmd != Cmd::Reset &&
-      cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus) {
+      cmd != Cmd::Open && cmd != Cmd::Ping && cmd != Cmd::GetStatus &&
+      cmd != Cmd::Credit) {
     sendError(Err::NotOpen);
     return;
   }
@@ -127,8 +143,15 @@ void Bridge::handleOpen(FrameReader& r, uint32_t nowMs) {
 
   cfg_ = cfg;
   state_ = PortState::Open;
+  // The tail of the previous session goes here, and it has to go from both
+  // places it can be sitting. resetSession() empties toHost_, but anything
+  // already framed and handed to the sink is past that point — and the
+  // sequence counters restart below, so those frames would arrive in the new
+  // session numbered for the old one and be read as a gap. PROTOCOL.md §5.1
+  // makes OPEN the way back to a known state; this is what that costs.
+  sink_.discardQueued();
   // Re-opening is the idempotent way back to a known state: buffers, windows
-  // and both sequence counters all restart here. PROTOCOL.md §5.1.
+  // and both sequence counters all restart here.
   resetSession(nowMs);
   hostRxBuffer_ = hostRx;
   sendWin_.reset(hostRx);
@@ -252,6 +275,12 @@ void Bridge::sendStatus() {
   w.u21(rxCount_);
   w.u21(txCount_);
   w.u14(sendWin_.credit());
+  // Trailing, so a host built against the original layout stops before it and
+  // is none the wiser. PROTOCOL.md §5.4.
+  // Asked of the backend rather than read from lastPresent_: a STATUS that
+  // arrives between an attach and the poll() that notices it should say what
+  // is true now, not what we have got around to announcing.
+  w.u7(backend_.present() ? 1 : 0);
   const size_t n = w.end();
   if (n) sink_.send(frameBuf_, n);
 }
@@ -361,23 +390,116 @@ void Bridge::pumpLines() {
   }
 }
 
+// Announcing a presence change is deferred when the USB endpoint is busy, so
+// the events queue rather than overwrite one another. The state change they
+// describe is never deferred: the port faults the moment the far end goes,
+// whether or not anyone can be told yet.
+void Bridge::queuePresence(Evt evt) {
+  if (presenceQueued_ < 2) {
+    presenceQueue_[presenceQueued_++] = evt;
+    return;
+  }
+  // Full. Drop the oldest, not the newest: the newest two still alternate and
+  // still end where the far end actually is, so the host is left with an
+  // accurate picture rather than a stale one.
+  presenceQueue_[0] = presenceQueue_[1];
+  presenceQueue_[1] = evt;
+}
+
+void Bridge::applyPresence(bool present) {
+  if (present) {
+    // A previous detach left us in Fault. The far end is new, so the fault
+    // is over — but the port is not open until the host says so.
+    if (state_ == PortState::Fault) state_ = PortState::Closed;
+    queuePresence(Evt::Attach);
+    return;
+  }
+
+  if (state_ == PortState::Open) {
+    // Last chance to collect what the far end already sent. Once close()
+    // has run, a backend is entitled to forget it.
+    pumpFromBackend();
+    backend_.close();
+    state_ = PortState::Fault;
+    // Bytes still queued for a port that no longer exists are not going to
+    // arrive; holding them would deliver them to whatever is plugged in
+    // next. What came *from* the device is still ours to deliver, so
+    // toHost_ is left alone.
+    toBackend_.clear();
+  }
+  queuePresence(Evt::Detach);
+}
+
+// Attach and detach are the one thing a host cannot discover by asking: until
+// something is attached there is nothing to open, and GET_STATUS on a closed
+// port looks the same either way. So they are watched as edges, counted by the
+// backend — a level would miss a detach and re-attach that both happen between
+// two polls, and leave the port Open against an adapter TinyUSB has since
+// reset to its own defaults. See Backend::presence().
+void Bridge::pumpPresence() {
+  const uint32_t presence = backend_.presence();
+  const bool present = (presence & 1u) != 0;
+  const uint32_t changes = presence >> 1;
+
+  uint32_t delta = changes - lastPresenceChanges_;
+  // A backend that cannot be unplugged leaves the count at zero for ever, and
+  // so does any Backend that has not overridden presence(). For those the
+  // level is the only evidence there is, and a change in it is one edge.
+  if (delta == 0 && present != lastPresent_) delta = 1;
+
+  if (delta != 0) {
+    lastPresenceChanges_ = changes;
+    // The run began by flipping away from what we last saw and ended at
+    // `present`; only those two ends are announced. A host acts on "my port
+    // faulted" and "there is one to open now", not on a count of how many
+    // times a connector bounced — and the first of the two is what carries the
+    // fault, so nothing that matters is collapsed away.
+    applyPresence(!lastPresent_);
+    if (delta >= 2 && present == lastPresent_) applyPresence(present);
+    lastPresent_ = present;
+  }
+
+  while (presenceQueued_ > 0 && sink_.ready()) {
+    const Evt evt = presenceQueue_[0];
+    presenceQueue_[0] = presenceQueue_[1];
+    --presenceQueued_;
+    sendEvent(evt, static_cast<uint8_t>(backend_.id()));
+  }
+}
+
 void Bridge::poll(uint32_t nowMs) {
   nowMs_ = nowMs;
-  if (state_ != PortState::Open) return;
 
-  BRIDGE_PHASE(10);
-  pumpToBackend();
-  BRIDGE_PHASE(11);
-  pumpFromBackend();
-  BRIDGE_PHASE(12);
-  pumpLines();
+  // Before the state check, deliberately: a detach is most of what a host in
+  // Fault or Closed is waiting to hear about.
+  BRIDGE_PHASE(16);
+  pumpPresence();
 
-  BRIDGE_PHASE(13);
-  if (sink_.ready() && recvWin_.shouldGrant(nowMs))
-    sendCredit(recvWin_.takeGrant(nowMs));
+  if (state_ == PortState::Open) {
+    BRIDGE_PHASE(10);
+    pumpToBackend();
+    BRIDGE_PHASE(11);
+    pumpFromBackend();
+    BRIDGE_PHASE(12);
+    pumpLines();
 
-  // Drain toward the host for as long as USB and the window both allow. The
-  // ready() check keeps a full USB endpoint from costing us buffered bytes.
+    BRIDGE_PHASE(13);
+    if (sink_.ready() && recvWin_.shouldGrant(nowMs))
+      sendCredit(recvWin_.takeGrant(nowMs));
+  }
+
+  // Outside the state check on purpose. Bytes already in toHost_ were received
+  // while the port was open; a detach or a CLOSE arriving a millisecond later
+  // does not un-receive them, and stranding them here would be exactly the
+  // silent loss the rest of this design goes out of its way to avoid.
+  //
+  // Two things have to be true for that to work rather than merely look like
+  // it works. The host's CREDIT has to be accepted with the port closed, or
+  // the drain stops at whatever window was left over (see onSysEx). And OPEN
+  // and RESET have to call sink_.discardQueued() as well as clearing toHost_,
+  // or a frame that left before the boundary arrives after it — carrying the
+  // old session's sequence number into the new one, which the host reads as a
+  // gap and as bytes it never asked for. DECISIONS.md D13.
   BRIDGE_PHASE(14);
   while (sink_.ready() && sendDataChunk()) {
   }
