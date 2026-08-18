@@ -8,6 +8,7 @@
 #include <Adafruit_TinyUSB.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
+#include <hardware/structs/iobank0.h>
 
 namespace bridge {
 
@@ -400,8 +401,18 @@ void CdcHostBackend::onDeviceUnmount(uint8_t daddr) { (void)daddr; }
 // question the software cannot otherwise answer: with no device event at all,
 // is the far end unpowered, is it wired backwards, or are the pull-downs
 // missing? Each reads differently here.
-bool CdcHostBackend::dpLevel() const { return gpio_get(kPinUsbDp); }
-bool CdcHostBackend::dmLevel() const { return gpio_get(kPinUsbDm); }
+//
+// Not gpio_get(), though. pio_usb_host_add_port() sets GPIO_OVERRIDE_INVERT on
+// the input path of both pins, and that override sits between the pad and
+// SIO — so gpio_get() returns the complement of the line and every reading
+// taken with it means the opposite of what it appears to. INFROMPAD in the
+// pin's status register is upstream of the override and is the actual pad.
+static bool padLevel(int pin) {
+  return (io_bank0_hw->io[pin].status & IO_BANK0_GPIO0_STATUS_INFROMPAD_BITS) != 0;
+}
+
+bool CdcHostBackend::dpLevel() const { return padLevel(kPinUsbDp); }
+bool CdcHostBackend::dmLevel() const { return padLevel(kPinUsbDm); }
 
 }  // namespace bridge
 

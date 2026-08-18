@@ -168,26 +168,31 @@ next person does not rediscover them.
   is the fastest way to split "nothing is attached" from "something is attached
   and enumeration is failing" without an oscilloscope. The debug build prints
   the raw pad levels as `bus=<dp><dm>`.
-- **Do not decode those levels with the USB convention — Pico-PIO-USB's is
-  inverted.** `pio_usb_bus_get_line_state()` reads each pin and flips it
-  (`dp = gpio_get(pin_dp) ? 0 : 1`) before packing them as `(dm << 1) | dp`,
-  so what the library calls `PORT_PIN_FS_IDLE` is D+ reading **low** and D−
-  reading **high** at the pad — the opposite way round from the J state a USB
-  reference describes. It is self-consistent: an empty port with both pins
-  pulled low decodes as `SE1`, which is not a valid idle, which is why an empty
-  port is correctly reported as not connected.
+- **`gpio_get()` lies about these two pins.** `pio_usb_host_add_port()` calls
+  `gpio_set_inover(pin, GPIO_OVERRIDE_INVERT)` on D+ and D−, and that override
+  sits between the pad and SIO — so `gpio_get()` returns the *complement* of
+  the line. The library's own `pio_usb_bus_get_line_state()` un-inverts it
+  again (`dp = gpio_get(pin_dp) ? 0 : 1`), which is why its `PORT_PIN_FS_IDLE`
+  really is the textbook full-speed idle of D+ high and D− low. Nothing about
+  the library's convention is unusual; the trap is reading those pins with
+  `gpio_get()` and believing the answer.
 
-  Reading `bus=` with the textbook convention instead produced a confident and
-  completely wrong diagnosis of a crossed D+/D− pair, and forcing
-  `-DBRIDGE_PIO_USB_SWAP` to "fix" it made the library classify a full-speed
-  device as low-speed. The raw levels are still worth printing, but the
-  interpretation that counts is `port: fullspeed=`, which is the library's own.
+  Read the pad instead: `INFROMPAD` in `io_bank0_hw->io[pin].status` is
+  upstream of the override. `bus=` reports that, so it now means what it says:
 
-  | `bus=` (dp,dm at the pad) | Library verdict | Meaning                    |
-  | ------------------------- | --------------- | -------------------------- |
-  | `00`                      | SE1, not connected | empty port, both pulled down |
-  | `01`                      | FS_IDLE         | full-speed device attached |
-  | `10`                      | LS_IDLE         | low-speed device attached  |
+  | `bus=` (D+,D− at the pad) | Meaning                                |
+  | ------------------------- | -------------------------------------- |
+  | `00`                      | idle, nothing attached                 |
+  | `10`                      | full-speed device (pull-up on D+)      |
+  | `01`                      | low-speed device (pull-up on D−)       |
+  | `11`                      | SE1, illegal — pull-downs wrong        |
+
+  This cost two wrong diagnoses before it was found: first a crossed D+/D−
+  pair that was not crossed, then an "inverted library convention" that was
+  really our own inverted read. Both were self-consistent enough to be
+  convincing. The lesson is narrow and worth keeping — when a reading disagrees
+  with a library's own verdict on the same pins, suspect the read, and go
+  looking for an override before theorising about conventions.
 
 - **Low speed is not a thing a serial adapter can be.** The USB spec allows
   low-speed devices control and interrupt transfers only — bulk endpoints are
@@ -240,6 +245,30 @@ next person does not rediscover them.
   Pico's VBUS pin is not a power budget for a downstream device; a far end
   that browns out part-way through enumeration presents exactly as this does,
   with the pull-up asserted, the reset accepted, and then silence.
+## Phase 2 on hardware, first run
+
+- **The port works, and the adapter matters more than anything else.** An FTDI
+  FT232R (`0403:6001`) enumerates, mounts as CDC and carries data both ways
+  through the whole path — MIDI, SysEx, core0's ring, core1, the USB host, the
+  adapter's UART, and back through a TX/RX loop. Two other full-speed adapters
+  on the same wiring never enumerated at all. "Full speed does not work on this
+  rig" was the wrong conclusion from those two; the rig was fine.
+- **The blocking control transfer really does hang core1, and the timed mailbox
+  really does survive it.** After a sweep, `host_tasks` stops advancing
+  entirely — core1 is stuck inside `tuh_cdc_set_line_coding()`, which has no
+  timeout — while core0 goes on running, `op_timeouts` reaches 2, the engine
+  reports `ERR_BACKEND` and the MIDI tunnel stays up to say so. That is
+  DECISIONS.md D8 working exactly as designed, and it had never been observed
+  before.
+- **But it cannot recover.** The op core1 abandoned still owns the mailbox, so
+  every subsequent `claimOp()` fails and the port is permanently `Fault` until
+  a reboot. Surviving the hang was the design goal and is not the same as
+  recovering from it; nothing reclaims a mailbox from a core that is never
+  coming back.
+- Bytes go missing before that, too: 4096 sent, 4088 back at 38400 and ~3500 at
+  9600 and 19200, with `to_dev=12288 from_dev=11094` on the counters. Not yet
+  diagnosed.
+
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs
