@@ -221,6 +221,25 @@ next person does not rediscover them.
   topology fault; it is either signal integrity at the higher rate or the
   device browning out. Worth remembering that a successful enumeration proves
   much less than it looks like it proves if it was a low-speed one.
+- **Two different full-speed devices fail identically where a low-speed one
+  succeeds**, on the same 5 cm of wire and the same 22 O series pair: both
+  reach `conn=1 fullspeed=1 susp=0` and neither ever fires `tuh_mount_cb`,
+  while a low-speed mouse enumerates every time. Recording the VID/PID on
+  every mount is what makes that readable — with a full-speed device attached
+  and `enum=` still naming the low-speed one, the currently attached device
+  demonstrably did not mount, which a bare counter could not have shown.
+- The clock dividers are exact at 120 MHz and are not the suspect: the host
+  path computes `cpu_freq / 48000000` for TX and `cpu_freq / 96000000` for RX
+  (`pio_usb_host.c`), giving 2.5 and 1.25, both exactly representable in the
+  PIO's 8.8 fixed-point divider. A wrong divider would also be likelier to
+  break the slower mode, not spare it.
+- Which leaves the supply as the first thing to rule out, and the asymmetry
+  is suggestive rather than mysterious: the device that works is a mouse
+  drawing ~25 mA, and the ones that fail are serial adapters that draw more
+  and have an inrush at power-up. hardware/README.md already warns that the
+  Pico's VBUS pin is not a power budget for a downstream device; a far end
+  that browns out part-way through enumeration presents exactly as this does,
+  with the pull-up asserted, the reset accepted, and then silence.
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs
