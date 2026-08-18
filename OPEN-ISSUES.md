@@ -104,13 +104,6 @@ anything driven by throughput pressure and looks like running out of time.
 ~3494. It is a genuine stall, and the ~600-byte figure at 9600 is reproducible
 across runs (3420, 3454, 3491, 3494, 3499, 3506).
 
-**Not yet ruled out.** `from_dev` freezing *after* the client gives up is
-expected and proves nothing — the host stops granting credit, `toHost_` fills,
-`fromDevice_` fills, and `pumpDevice` correctly stops reading. The measurement
-that matters is whether `from_dev` is still advancing *during* the transfer,
-and the one attempt to sample that was spoiled by the board stalling on
-issue 1 partway through. Redo it once issue 1 is contained.
-
 **One variable removed.** Phase 1 and phase 2 now build the same TinyUSB
 (issue 5), and on that same stack the hardware-UART loopback returns all 4096
 bytes at 9600 where the CDC backend loses ~600. The loss is in the CDC path or
@@ -118,12 +111,36 @@ the adapter, not in the engine, the SysEx framing, the credit windowing or the
 USB device stack — all of which the phase 1 rig exercises identically and
 without loss.
 
-**Where to look.** `lines=0x03` — TinyUSB asserts DTR and RTS during
-enumeration (`CFG_TUH_CDC_LINE_CONTROL_ON_ENUM`, not overridable) while CTS is
-floating on the bench rig. If the FT232R has RTS/CTS flow control enabled it
-will stop transmitting when CTS deasserts, which would present exactly like
-this. The FT232R's 256-byte FIFOs and its latency timer on a TX/RX loop are the
-other candidates.
+**Ruled out at the desk, 2026-08-18 — do not re-test these at the bench.**
+
+- *Floating CTS on the bench rig.* The theory was that `lines=0x03` (TinyUSB
+  asserts DTR and RTS during enumeration via `CFG_TUH_CDC_LINE_CONTROL_ON_ENUM`)
+  plus an unconnected CTS would stop the FT232R transmitting. It cannot:
+  `cdc_host.c:1257` sends `FTDI_SIO_DISABLE_FLOW_CTRL` as part of the FTDI
+  set-config sequence, so hardware flow control is off on the adapter and CTS
+  gates nothing. No jumper on the FTDI's CTS is worth fitting.
+- *A second, shorter timeout hiding behind `--timeout`.* `readExactly`
+  (`host/src/client.js:250`) arms exactly one `setTimeout` for the whole read
+  and has no idle or quiet timer, so the 180 000 ms run really did wait 180 s.
+  The stall is confirmed genuine rather than an artefact of the measurement.
+- *The host withholding credit.* `#maybeReturnCredit` returns credit as soon as
+  `freed` reaches half the window, and otherwise arms a `CREDIT_IDLE_MS`
+  fallback that fires on the tail. A host that has stopped receiving still
+  grants. If credit is the mechanism, the accounting error is device-side, in
+  `toHost_`/`fromDevice_`, not in the client.
+
+**Where to look now.** The FT232R's 256-byte FIFOs and its latency timer on a
+TX/RX loop are what remain of the original candidate list. Device-side credit
+accounting — `toHost_` and `fromDevice_` in `cdc_host_backend` — is the new
+one, and is where the desk work above points.
+
+**The measurement still owed**, and it is unchanged: `from_dev` freezing
+*after* the client gives up is expected and proves nothing — the host stops
+granting credit, `toHost_` fills, `fromDevice_` fills, and `pumpDevice`
+correctly stops reading. What matters is whether `from_dev` is still advancing
+*during* the transfer. The one attempt to sample that was spoiled by the board
+stalling on issue 1 partway through, which is why issue 1 is a prerequisite
+rather than a parallel track.
 
 ---
 
