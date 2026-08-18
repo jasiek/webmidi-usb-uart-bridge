@@ -136,9 +136,12 @@ class CdcHostBackend : public Backend {
   bool clockOk() const { return clockOk_; }
   uint32_t deviceMounts() const { return deviceMounts_; }
   // The raw bus levels, for when nothing enumerates and the question is
-  // whether anything is electrically there. Idle host with the pull-downs
-  // fitted and nothing plugged in reads 0,0; a powered full-speed device
-  // pulls D+ up through 1.5 kO and reads 1,0. See busStateName().
+  // whether anything is electrically there. An idle port with nothing plugged
+  // in reads 0,0. Beyond that, do not decode these with the USB convention:
+  // Pico-PIO-USB inverts both pins before deciding what the line state is, so
+  // the library calls 0,1 full speed and 1,0 low speed — the opposite way
+  // round from the J state a reference describes. Trust the debug build's
+  // `port: fullspeed=` over these. FINDINGS.md has the table.
   bool dpLevel() const;
   bool dmLevel() const;
   uint16_t lastVid() const { return lastVid_; }

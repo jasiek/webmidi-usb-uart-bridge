@@ -167,18 +167,33 @@ next person does not rediscover them.
 - The bus pins can be read straight back as GPIOs while the bus is idle, which
   is the fastest way to split "nothing is attached" from "something is attached
   and enumeration is failing" without an oscilloscope. The debug build prints
-  them as `bus=<dp><dm>`:
+  the raw pad levels as `bus=<dp><dm>`.
+- **Do not decode those levels with the USB convention — Pico-PIO-USB's is
+  inverted.** `pio_usb_bus_get_line_state()` reads each pin and flips it
+  (`dp = gpio_get(pin_dp) ? 0 : 1`) before packing them as `(dm << 1) | dp`,
+  so what the library calls `PORT_PIN_FS_IDLE` is D+ reading **low** and D−
+  reading **high** at the pad — the opposite way round from the J state a USB
+  reference describes. It is self-consistent: an empty port with both pins
+  pulled low decodes as `SE1`, which is not a valid idle, which is why an empty
+  port is correctly reported as not connected.
 
-  | `bus=` | Meaning                                                        |
-  | ------ | -------------------------------------------------------------- |
-  | `00`   | idle, nothing powered on the port — or VBUS/D+ not connected    |
-  | `10`   | a full-speed device is attached and asserting its pull-up       |
-  | `01`   | a low-speed device, or D+/D- swapped                            |
-  | `11`   | SE1: illegal — pull-downs missing or wired across the pair      |
+  Reading `bus=` with the textbook convention instead produced a confident and
+  completely wrong diagnosis of a crossed D+/D− pair, and forcing
+  `-DBRIDGE_PIO_USB_SWAP` to "fix" it made the library classify a full-speed
+  device as low-speed. The raw levels are still worth printing, but the
+  interpretation that counts is `port: fullspeed=`, which is the library's own.
 
-  `enum=` beside it counts *every* device that enumerates whatever its class,
-  from `tuh_mount_cb`, so `attached=0 enum=1` is a device that is not a serial
-  adapter while `attached=0 enum=0` never got that far.
+  | `bus=` (dp,dm at the pad) | Library verdict | Meaning                    |
+  | ------------------------- | --------------- | -------------------------- |
+  | `00`                      | SE1, not connected | empty port, both pulled down |
+  | `01`                      | FS_IDLE         | full-speed device attached |
+  | `10`                      | LS_IDLE         | low-speed device attached  |
+
+- **Low speed is not a thing a serial adapter can be.** The USB spec allows
+  low-speed devices control and interrupt transfers only — bulk endpoints are
+  prohibited below full speed — and CDC/ACM moves its data over bulk IN/OUT.
+  So `fullspeed=0` on this port never means "a slow serial adapter"; it means
+  the pair is crossed, or what is plugged in is a keyboard.
 - **`enum=` and `bus=` still cannot tell "never detected" from "detected and
   enumeration failed".** Both read `enum=0`, and that is the difference between
   a wiring fault and a signal-integrity one. The root port itself knows:

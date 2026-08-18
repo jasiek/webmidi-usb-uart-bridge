@@ -200,6 +200,10 @@ void serviceDebug(uint32_t nowMs) {
     // enumeration failed, while conn=0 with a pull-up on the bus means the
     // detection itself is not happening. ep_err counts transfers that came
     // back broken, which is what bad signal integrity looks like from here.
+    //
+    // `fullspeed` is the reading to trust over the raw bus= levels above:
+    // Pico-PIO-USB inverts each pin before decoding the line state, so the
+    // pad levels do not mean what a USB reference says they mean. FINDINGS.md.
     if (SerialTinyUSB.availableForWrite() >= 64) {
       bridge_pio_usb_port_t rp;
       bridge_pio_usb_probe(&rp);
