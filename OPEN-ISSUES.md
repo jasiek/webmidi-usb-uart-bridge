@@ -468,9 +468,28 @@ wholesale from phase 1's measured tunnel ceiling (DECISIONS.md D5). Nothing has
 measured what this backend can actually carry — and it has a different shape,
 with a USB hop and two cross-core rings where phase 1 had a UART register.
 
-`host/bin/throughput.js` exists and is what produced the phase 1 table. It
-cannot be run meaningfully until issue 3 is fixed, since a sweep that loses
-bytes measures nothing.
+`host/bin/throughput.js` exists and is what produced the phase 1 table. Issue 3
+is fixed, so a sweep no longer measures a lossy link — but **it still cannot be
+run, and the blocker is now issue 1.**
+
+Attempted 2026-08-18 immediately after the latency fix, on a port that had
+enumerated cleanly and passed the full loopback suite twice. Core1 wedged about
+two seconds into the first baud:
+
+```
+host_tasks frozen, core1 stopped in: pump_device
+to_dev=2062 from_dev=1957 op_timeouts=0
+to_dev_ring=4095   <- core0 still filling a ring nobody is draining
+```
+
+The sweep then sat in client timeouts for twenty minutes and was killed. A
+throughput sweep is sustained load by definition, which is exactly what
+provokes issue 1, so this measurement is gated on containing that rather than
+on anything of its own. The loopback suite passes because 4096 bytes at a time
+is short enough to finish between wedges.
+
+`INFO.maxBaud` therefore still reports a phase 1 number on a phase 2 backend,
+which is precisely what D5 exists to prevent.
 
 Until then `maxBaud` is a promise the backend has not been shown to keep, which
 is precisely the thing D5 exists to stop.
