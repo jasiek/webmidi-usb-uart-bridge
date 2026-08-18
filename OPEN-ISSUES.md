@@ -1,0 +1,222 @@
+# Open issues
+
+What is known to be wrong and not yet fixed, as of the phase 2 hardware
+bring-up on 2026-08-18. FINDINGS.md records what was *learned*; this records
+what is still owed.
+
+Each entry says what the symptom is, what has been ruled out, and what the next
+step would be — so that picking one up does not start by repeating the
+elimination.
+
+The bench rig for all of this: a Pico 1 with a Pico-PIO-USB host port on
+GPIO16/17 (22 Ω series, 15 kΩ pull-downs to ground, 5 cm of wire), an FTDI
+FT232R (`0403:6001`) plugged into it with its serial TX shorted to its RX, and
+`pio run -e pico_cdc_debug` for the counters.
+
+---
+
+## 1. Core1 stalls inside `tuh_task()` — intermittent, needs a power cycle
+
+**Severity: blocker for phase 2.**
+
+`host_tasks` stops advancing and never resumes. The debug build reports
+`CORE1-STALLED` and `core1 stopped in: usb_task`, i.e. inside
+`Adafruit_USBH_Host::task()` → `tuh_task_ext()`, not in any of our code.
+
+Intermittent. The same adapter on the same wiring enumerates cleanly on one
+boot and hangs the core on the next, and it can also hang mid-transfer after
+minutes of correct operation.
+
+**Ruled out.** Not our mailbox — the clearest instance had `enum=0` *and*
+`op_timeouts=0`, so core1 died before an op was ever posted. Not the two
+causes already fixed in `a82f34e`: the phase marker moved off `execute_op` when
+the control transfers went asynchronous, and off `pump_device` when the pump
+loops were bounded. Not the clock (dividers are exact at 120 MHz), not the
+wiring (a low-speed mouse and the FTDI both enumerate over it), not VBUS
+(5.14 V measured at the socket under load).
+
+**Likely cause.** `tuh_control_xfer()` spins on
+`while (result == XFER_RESULT_INVALID) tuh_task_ext(0, false);` with a
+`// TODO probably some timeout to prevent hanged` above it, and the
+`timeout_ms` field in `tuh_xfer_t` is present with `not supported yet` beside
+it. Enumeration and the class drivers both reach it. A device that stops
+answering mid-request therefore takes the core with it, and nothing in TinyUSB
+will ever give it back.
+
+**Next step.** This is not fixable from our side of the API, so the realistic
+options are containment rather than repair:
+
+- A supervisory reset of core1 when `hostAlive()` goes false — `rp2040`
+  exposes `restartCore1()`, but re-running `USBHost.begin(1)` against PIO state
+  machines and DMA channels that are already claimed needs checking before it
+  can be relied on, and a half-initialised host port is worse than a dead one.
+- Failing that, a full software reset via the existing watchdog path, which the
+  protocol already models honestly: the far end goes away and comes back as
+  `EVT_DETACH` / `EVT_ATTACH`, which the engine and the host client both
+  already handle.
+
+Core0 already detects the condition and reports `ERR_BACKEND` promptly rather
+than presenting a dead host stack as an empty port, so the failure is at least
+visible. It is not recoverable.
+
+---
+
+## 2. Nothing restarts a wedged core1
+
+**Severity: high. The other half of issue 1.**
+
+Surviving the hang and recovering from it are different things, and only the
+first is done. When core1 stops:
+
+- core0 keeps running, the MIDI tunnel stays up, and the watchdog keeps being
+  fed — this all works and is the point of the two-core split (DECISIONS.md D8).
+- `claimOp()` sees `hostAlive()` false and fails immediately, so ops no longer
+  cost a one-second timeout each. Also works.
+- But the port stays `Fault` until the board is power-cycled. Nothing reclaims
+  a mailbox from a core that is never coming back, and nothing restarts the
+  core.
+
+Worth separating from issue 1 because it is *ours* and would be worth doing
+even if TinyUSB grew a timeout tomorrow: any backend on a separate core needs a
+recovery story, not just a detection story.
+
+---
+
+## 3. The loopback loses bytes, and it is not slowness
+
+**Severity: high. Undiagnosed.**
+
+With both stalls fixed, all five bauds run to completion but none returns the
+full payload:
+
+| Baud   | Returned of 4096 | Short by |
+| ------ | ---------------- | -------- |
+| 9600   | 3491             | 605      |
+| 19200  | 3566             | 530      |
+| 38400  | 4070             | 26       |
+| 57600  | 4073             | 23       |
+| 115200 | 4091             | 5        |
+
+The shortfall shrinks as the baud rises, which is the wrong way round for
+anything driven by throughput pressure and looks like running out of time.
+
+**It is not running out of time.** A 180 000 ms timeout at 9600 still stops at
+~3494. It is a genuine stall, and the ~600-byte figure at 9600 is reproducible
+across runs (3420, 3454, 3491, 3494, 3499, 3506).
+
+**Not yet ruled out.** `from_dev` freezing *after* the client gives up is
+expected and proves nothing — the host stops granting credit, `toHost_` fills,
+`fromDevice_` fills, and `pumpDevice` correctly stops reading. The measurement
+that matters is whether `from_dev` is still advancing *during* the transfer,
+and the one attempt to sample that was spoiled by the board stalling on
+issue 1 partway through. Redo it once issue 1 is contained.
+
+**Where to look.** `lines=0x03` — TinyUSB asserts DTR and RTS during
+enumeration (`CFG_TUH_CDC_LINE_CONTROL_ON_ENUM`, not overridable) while CTS is
+floating on the bench rig. If the FT232R has RTS/CTS flow control enabled it
+will stop transmitting when CTS deasserts, which would present exactly like
+this. The FT232R's 256-byte FIFOs and its latency timer on a TX/RX loop are the
+other candidates.
+
+---
+
+## 4. Two full-speed adapters never enumerate at all
+
+**Severity: medium. Possibly not our problem, but unexplained.**
+
+The original USB-serial "loopback dongle" and a PL2303 both reach `conn=1
+fullspeed=1 susp=0` — detected and bus-reset by TinyUSB — and never fire a
+mount callback. On the same wiring an FTDI enumerates and a low-speed mouse
+enumerates.
+
+Note this is *not* the PL2303 driver gap it first looked like: TinyUSB 3.7.7,
+which is what `pico_cdc` actually builds, has a `SERIAL_DRIVER_PL2303`. That
+claim came from reading 3.4.4 by mistake (issue 5) and has been retracted.
+Enumeration happens below the class drivers in any case, and enumeration is
+what is failing.
+
+Plausibly the same root cause as issue 1 — a device that answers a control
+request slowly or not at all — in which case it resolves with that. Plausibly
+just two bad adapters. Cheap test: try each one on a host that is known good
+and see whether it enumerates there.
+
+---
+
+## 5. `pico` and `pico_cdc` build against different TinyUSB versions
+
+**Severity: medium. Half-fixed.**
+
+Naming Pico-PIO-USB in `lib_deps` makes the library dependency finder resolve
+Adafruit TinyUSB from the registry for that environment, instead of using the
+copy bundled with the core. The result:
+
+| Environment  | TinyUSB | From                                      |
+| ------------ | ------- | ----------------------------------------- |
+| `pico`       | 3.4.4   | `framework-arduinopico/libraries/`        |
+| `pico_debug` | 3.4.4   | same                                      |
+| `pico_cdc`   | 3.7.7   | `.pio/libdeps/`, now pinned in `platformio.ini` |
+| `pico_cdc_debug` | 3.7.7 | same                                     |
+
+The version is pinned now, so it is a decision rather than a download date, but
+**the divergence itself remains**: two USB stacks in one project, and the phase
+1 throughput measurements in FINDINGS.md were taken on a stack that phase 2
+does not use.
+
+The versions differ in ways that matter — 3.4.4 has FTDI's `set_line_coding`,
+`set_data_format` and the whole async path as `// TODO not implemented yet`
+stubs, and no PL2303 driver at all — so this is not a cosmetic difference.
+
+**Next step.** Decide whether to move every environment to 3.7.7. That means
+re-validating phase 1 on it, including the throughput sweep and the
+`__usb_mutex` wedge fix, so it is not free. Leaving it as-is is defensible but
+should be a recorded decision rather than an accident.
+
+---
+
+## 6. Phase 2 throughput has never been measured
+
+**Severity: medium.**
+
+`INFO.maxBaud` reports 460800 on the CDC backend, and that number is inherited
+wholesale from phase 1's measured tunnel ceiling (DECISIONS.md D5). Nothing has
+measured what this backend can actually carry — and it has a different shape,
+with a USB hop and two cross-core rings where phase 1 had a UART register.
+
+`host/bin/throughput.js` exists and is what produced the phase 1 table. It
+cannot be run meaningfully until issue 3 is fixed, since a sweep that loses
+bytes measures nothing.
+
+Until then `maxBaud` is a promise the backend has not been shown to keep, which
+is precisely the thing D5 exists to stop.
+
+---
+
+## 7. The bench rig cannot prove the top end
+
+**Severity: low. Known limitation, already in `hardware/README.md`.**
+
+A single adapter with TX shorted to RX cannot transmit faster than it is being
+sent to, so it cannot demonstrate overrun or find the real ceiling. Two
+adapters wired TX↔RX to each other is the rig that can. Same caveat as phase 1,
+recorded here so it is not forgotten when issue 6 is picked up.
+
+---
+
+## 8. Flashing `pico_cdc` sometimes drops the board off USB entirely
+
+**Severity: low. Possibly environmental.**
+
+Three times during bring-up, `pio run -t upload` did the 1200-baud touch, the
+board left MIDI mode, and it never came back as a BOOTSEL device — not
+enumerating at all, with `picotool info -a` finding nothing. Recovery is a
+manual BOOTSEL-held replug. `picotool reboot -f -u` does not help; the firmware
+exposes no reset interface.
+
+Twice the board was behind a VIA Labs hub, which is the obvious suspect, but it
+happened at least once on a direct port. One of the three was self-inflicted
+and is understood — a build that routed TinyUSB's host log to the shared CDC
+console wedged the device stack, so the touch had nothing to listen for it (see
+FINDINGS.md; do not retry that).
+
+Worth watching rather than chasing. If it recurs on a direct port with a clean
+build, it is real.

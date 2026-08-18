@@ -166,6 +166,11 @@ caveat there about what a loopback can and cannot prove.
   itself has never been powered up** — building it needs the resistors and
   pull-downs in `hardware/README.md`.
 
+Phase 2's open defects — the core1 stall, the missing bytes on a loopback, and
+the throughput that has never been measured — are written up in
+[OPEN-ISSUES.md](OPEN-ISSUES.md), with what has already been ruled out for each
+so that picking one up does not start by repeating the elimination.
+
 Known gaps in phase 1, all of them honest in `INFO.caps` rather than faked:
 DTR/DSR/DCD/RI have no pin on a bare UART; RTS/CTS are hardware flow control
 rather than lines the host can drive; and framing and parity errors cannot be
