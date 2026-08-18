@@ -105,6 +105,14 @@ class CdcHostBackend : public Backend {
   void onMount(uint8_t idx);
   void onUnmount(uint8_t idx);
 
+  // Device-level mount, one level below the CDC one above. A port with nothing
+  // on it and a port with something on it that is not a serial adapter both
+  // report attached=0, and during bring-up those two have completely different
+  // causes — the first is the wiring, the second is the device. Recording every
+  // enumeration, whatever class it turns out to be, is what separates them.
+  void onDeviceMount(uint8_t daddr, uint16_t vid, uint16_t pid);
+  void onDeviceUnmount(uint8_t daddr);
+
   // Diagnostics for the debug build. Reads are racy by nature and that is
   // fine — they are counters, not control flow.
   uint32_t hostTasks() const { return hostTasks_; }
@@ -112,6 +120,15 @@ class CdcHostBackend : public Backend {
   uint32_t bytesFromDevice() const { return bytesFromDevice_; }
   uint32_t opTimeouts() const { return opTimeouts_; }
   bool clockOk() const { return clockOk_; }
+  uint32_t deviceMounts() const { return deviceMounts_; }
+  // The raw bus levels, for when nothing enumerates and the question is
+  // whether anything is electrically there. Idle host with the pull-downs
+  // fitted and nothing plugged in reads 0,0; a powered full-speed device
+  // pulls D+ up through 1.5 kO and reads 1,0. See busStateName().
+  bool dpLevel() const;
+  bool dmLevel() const;
+  uint16_t lastVid() const { return lastVid_; }
+  uint16_t lastPid() const { return lastPid_; }
 
  private:
   // The mailbox. Core0 claims the slot, fills the argument fields, stores the
@@ -176,6 +193,9 @@ class CdcHostBackend : public Backend {
   uint32_t hostTasks_ = 0;
   uint32_t bytesToDevice_ = 0;
   uint32_t bytesFromDevice_ = 0;
+  uint32_t deviceMounts_ = 0;
+  uint16_t lastVid_ = 0;
+  uint16_t lastPid_ = 0;
   // Written by core0 only.
   uint32_t opTimeouts_ = 0;
   bool clockOk_ = false;

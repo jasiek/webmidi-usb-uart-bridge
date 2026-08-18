@@ -152,6 +152,33 @@ next person does not rediscover them.
   blocks in the event queue until the USB stack has something to say. In a
   `loop1()` that also has to move bytes, that default means the byte-moving
   half runs only when USB happens to generate an event. `USBHost.task(0)`.
+- **Pico-PIO-USB enables the RP2040's own pull-downs on D+ and D-**
+  (`gpio_pull_down()` in `pio_usb.c`, and again in the rx/tx PIO helpers), so
+  the external 15 kO pull-downs the reference circuit asks for are a
+  signal-integrity and spec-compliance measure rather than the thing that makes
+  attach detection work. A port with none fitted still reads a clean 0,0 idle
+  and still detects a device. Worth knowing during bring-up, because "no
+  pull-downs" is the first thing suspected and it is usually not the fault.
+- **The pull-downs are two resistors to ground, not one across the pair.** A
+  single 15 kO bridging D+ to D- looks like the same part count and is not the
+  same circuit: with a full-speed device's 1.5 kO pull-up on D+ it drags D-
+  up with it (~3.1 V and ~2.4 V against the internal 50 kO pull-downs), which
+  is SE1 — an illegal bus state that no host will enumerate through.
+- The bus pins can be read straight back as GPIOs while the bus is idle, which
+  is the fastest way to split "nothing is attached" from "something is attached
+  and enumeration is failing" without an oscilloscope. The debug build prints
+  them as `bus=<dp><dm>`:
+
+  | `bus=` | Meaning                                                        |
+  | ------ | -------------------------------------------------------------- |
+  | `00`   | idle, nothing powered on the port — or VBUS/D+ not connected    |
+  | `10`   | a full-speed device is attached and asserting its pull-up       |
+  | `01`   | a low-speed device, or D+/D- swapped                            |
+  | `11`   | SE1: illegal — pull-downs missing or wired across the pair      |
+
+  `enum=` beside it counts *every* device that enumerates whatever its class,
+  from `tuh_mount_cb`, so `attached=0 enum=1` is a device that is not a serial
+  adapter while `attached=0 enum=0` never got that far.
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs

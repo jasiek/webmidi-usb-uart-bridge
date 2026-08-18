@@ -178,16 +178,20 @@ void serviceDebug(uint32_t nowMs) {
   // mailbox getting answers (op_timeouts flat).
   if (SerialTinyUSB.availableForWrite() >= 96) {
     SerialTinyUSB.printf(
-        "    cdc: clk=%luMHz%s attached=%d host_tasks=%lu to_dev=%lu"
-        " from_dev=%lu op_timeouts=%lu lines=0x%02x\r\n",
+        "    cdc: clk=%luMHz%s attached=%d enum=%lu(%04x:%04x) host_tasks=%lu to_dev=%lu"
+        " from_dev=%lu op_timeouts=%lu lines=0x%02x bus=%d%d\r\n",
         static_cast<unsigned long>(clock_get_hz(clk_sys) / 1000000u),
         bridge::gCdcHost.clockOk() ? "" : " BAD(not a multiple of 12)",
         bridge::gCdcHost.present() ? 1 : 0,
+        static_cast<unsigned long>(bridge::gCdcHost.deviceMounts()),
+        static_cast<unsigned>(bridge::gCdcHost.lastVid()),
+        static_cast<unsigned>(bridge::gCdcHost.lastPid()),
         static_cast<unsigned long>(bridge::gCdcHost.hostTasks()),
         static_cast<unsigned long>(bridge::gCdcHost.bytesToDevice()),
         static_cast<unsigned long>(bridge::gCdcHost.bytesFromDevice()),
         static_cast<unsigned long>(bridge::gCdcHost.opTimeouts()),
-        bridge::gCdcHost.outputLines());
+        bridge::gCdcHost.outputLines(),
+        bridge::gCdcHost.dpLevel() ? 1 : 0, bridge::gCdcHost.dmLevel() ? 1 : 0);
   }
 #endif
 

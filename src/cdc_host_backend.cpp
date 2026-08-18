@@ -7,6 +7,7 @@
 
 #include <Adafruit_TinyUSB.h>
 #include <hardware/clocks.h>
+#include <hardware/gpio.h>
 
 namespace bridge {
 
@@ -381,6 +382,27 @@ void CdcHostBackend::onUnmount(uint8_t idx) {
   // reach the host.
 }
 
+// Deliberately not touching presence_: presence means "there is a serial port
+// here", and a keyboard on the host port is not one. This is a counter for the
+// debug line and nothing else, which is why it is safe to record any class of
+// device without the engine ever seeing it.
+void CdcHostBackend::onDeviceMount(uint8_t daddr, uint16_t vid, uint16_t pid) {
+  (void)daddr;
+  ++deviceMounts_;
+  lastVid_ = vid;
+  lastPid_ = pid;
+}
+
+void CdcHostBackend::onDeviceUnmount(uint8_t daddr) { (void)daddr; }
+
+// Pico-PIO-USB leaves both pins as inputs while the bus is idle, so the pad
+// level is the bus level and reading it costs nothing. This is the one
+// question the software cannot otherwise answer: with no device event at all,
+// is the far end unpowered, is it wired backwards, or are the pull-downs
+// missing? Each reads differently here.
+bool CdcHostBackend::dpLevel() const { return gpio_get(kPinUsbDp); }
+bool CdcHostBackend::dmLevel() const { return gpio_get(kPinUsbDm); }
+
 }  // namespace bridge
 
 // ---- TinyUSB host callbacks, on core1 --------------------------------------
@@ -388,5 +410,17 @@ void CdcHostBackend::onUnmount(uint8_t idx) {
 extern "C" void tuh_cdc_mount_cb(uint8_t idx) { bridge::gCdcHost.onMount(idx); }
 
 extern "C" void tuh_cdc_umount_cb(uint8_t idx) { bridge::gCdcHost.onUnmount(idx); }
+
+// Fires for every device that enumerates, whatever its class — including the
+// ones tuh_cdc_mount_cb never will.
+extern "C" void tuh_mount_cb(uint8_t daddr) {
+  uint16_t vid = 0, pid = 0;
+  tuh_vid_pid_get(daddr, &vid, &pid);
+  bridge::gCdcHost.onDeviceMount(daddr, vid, pid);
+}
+
+extern "C" void tuh_umount_cb(uint8_t daddr) {
+  bridge::gCdcHost.onDeviceUnmount(daddr);
+}
 
 #endif  // BRIDGE_BACKEND_CDC_HOST
