@@ -149,7 +149,7 @@ mean something else.
 
 ---
 
-## 3. The loopback loses bytes, and it is not slowness
+## 3. The loopback loses bytes — diagnosed, fix not yet landed
 
 **Severity: high. Undiagnosed.**
 
@@ -249,7 +249,61 @@ kills "it ran out of time" for good, and it also kills the framing of this
 issue as a *stall*: the earlier `from_dev` freeze is the tail of the loss, not
 its mechanism.
 
-**Leading hypothesis: nothing paces our writes to the far end's line rate.**
+**Solved: it is the FTDI's latency timer, and the fix is one control request.**
+
+**Diagnosed 2026-08-18.** The drops are periodic, and the period is the
+FT232R's latency timer.
+
+`host/bin/gap-analysis.mjs` at 9600 shows 185 gaps in 4096 bytes with
+gap-to-gap spacings clustered on multiples of ~15.5 bytes: `15x74 16x43 31x41
+30x16 46x4 61x2`. At 9600 baud 15.5 bytes is **16 ms**, which is the FT232R's
+default latency timer — the interval at which it sends up an IN packet when
+data is only trickling. Loss happens at those packet boundaries, and the rate
+scales with how many boundaries there are. At 38400 and 115200 the few losses
+that remain still land on multiples of the same 16 ms window (114 ≈ 2 × 61,
+639 ≈ 3.5 × 184).
+
+**Confirmed by changing it.** With the timer set to 100 ms instead of 16 ms,
+at 9600: **4096 sent, 4092 back, 1 gap** — against 715 bytes lost in 185 gaps
+immediately before, same board, same wiring, same run. The full suite goes from
+five failures to four clean passes:
+
+| Baud   | Before (of 4096) | After |
+| ------ | ---------------- | ----- |
+| 9600   | 3491             | 4095  |
+| 19200  | 3566             | 4096  |
+| 38400  | 4070             | 4096  |
+| 57600  | 4073             | 4096  |
+| 115200 | 4091             | 4096  |
+
+**TinyUSB cannot set it.** `CFG_TUH_CDC_FTDI_LATENCY` exists but the code
+behind it does not compile — `cdc_host.c:1241` calls `ftdi_process_config`,
+which is undeclared, and the declaration statement inside the `switch` case
+needs braces. It is dead code that nobody has ever enabled. The measurement
+above was taken with a one-line local patch to `.pio/libdeps`, which is
+deliberately **not** committed: a build flag that only works against a patched
+library is worse than no flag.
+
+**The fix that belongs in this repo** is to send the request ourselves. The
+backend already issues asynchronous control transfers with completion callbacks
+(`startLineCoding`, `startControlLines`), and the latency timer is one more of
+the same: request `0x09`, type `0x40`, value = milliseconds, index = channel.
+Chaining a `startLatencyTimer()` after mount needs no library patch and no
+build flag.
+
+**What value to use** is a real trade-off and should be a recorded decision.
+The timer is how long the adapter waits before sending a short packet, so it is
+also the floor on read latency for small messages. 100 ms proved the mechanism;
+it is almost certainly too slow for an interactive tunnel. The sweep to run is
+loss against latency across a few values.
+
+**Pacing the outbound pump did not fix this** and is committed anyway, with its
+reasoning; it wants a decision of its own — see the note at the end.
+
+---
+
+**Superseded hypothesis, kept because it was wrong in a useful way: nothing
+paces our writes to the far end's line rate.**
 `tuh_cdc_write()` accepts bytes at USB speed and `tuh_cdc_write_available()`
 reports space in *TinyUSB's* FIFO, not the adapter's. At 9600 baud the FT232R
 can clock out 960 bytes a second and we hand it bytes several thousand times
@@ -258,10 +312,13 @@ this problem because `UartBackend::write` gates on `uart_is_writable()`, which
 is real hardware back-pressure; the USB hop hides it. It also explains the baud
 dependence exactly — the faster the line, the smaller the mismatch.
 
-**What would confirm it**, and is the obvious next step: pace the outbound pump
-to the configured baud (a token bucket in `pumpDevice`, bytes ≈ elapsed × baud
-÷ 10) and see whether the loss disappears. If it does, that is both the
-diagnosis and the fix.
+**It was tested and it is not the cause.** With a token bucket metering the
+outbound pump to the port's actual frame rate, 9600 still lost 715 of 4096 —
+marginally worse than the 653 lost without it. The reasoning still holds as
+reasoning; it simply was not what was happening. The pacing code is still in
+`pumpDevice` and its value is **unproven**: the A/B that would settle whether
+it is load-bearing alongside the latency fix was cut short when the adapter
+stopped enumerating. Either finish that A/B or take it out.
 
 **Not yet characterised**, and worth doing first because it is cheap: the
 *distribution* of the drops. A buffer overrun should lose contiguous runs when

@@ -386,6 +386,25 @@ next person does not rediscover them.
   like a truncation and is not one, and the counter that made it look like a
   stall was measuring the end of the loss rather than its cause.
 
+- **The FT232R's latency timer is the phase 2 byte loss.** Its default is
+  16 ms, and at 9600 baud that is 15.5 bytes — exactly the period the drops
+  cluster on (`15x74 16x43 31x41 30x16` in `gap-analysis.mjs`). Bytes are lost
+  at IN-packet boundaries, so the loss rate follows how many boundaries there
+  are, which is why it looked baud-dependent and why it looked like a stall.
+  Raising the timer to 100 ms took 9600 from 715 bytes lost to 1, and the
+  loopback suite from five failures to four clean passes.
+- **A period is worth more than a total.** "Short by 600 bytes" supported four
+  different wrong theories for weeks. The gap *spacing* named the mechanism in
+  one run, and the only reason it was available is that the analysis aligns the
+  returned stream against the sent one instead of counting it.
+- **TinyUSB's `CFG_TUH_CDC_FTDI_LATENCY` does not compile.** `cdc_host.c:1241`
+  calls an undeclared `ftdi_process_config` and declares a variable inside a
+  `switch` case without braces. It is dead code behind an `#ifdef` that nobody
+  has enabled, so defining the macro breaks the build rather than configuring
+  anything. Send the vendor request from our own backend instead — request
+  `0x09`, type `0x40`, value = ms — which is the same shape as the line-coding
+  transfer the backend already does asynchronously.
+
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs
