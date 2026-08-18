@@ -5,6 +5,8 @@
 
 #include "cdc_host_backend.h"
 
+#include "pio_usb_probe.h"
+
 #include <Adafruit_TinyUSB.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
@@ -545,9 +547,62 @@ void CdcHostBackend::pumpDevice() {
 
 // Core0 watches this for movement, not for a value: any change means core1
 // came back round its loop since the last look.
+// A root port that is `connected` and `suspended` at the same time is deaf.
+// The library only evaluates `connection_check()` — the sole path that clears
+// `connected` and raises a disconnect — when the port is *not* suspended, and
+// it only looks for a new connection when the port is *not* connected. So both
+// flags together is a state with no exit: unplugging the device changes
+// nothing the library will notice, and neither does plugging it back in.
+// OPEN-ISSUES.md 4 has the line numbers.
+//
+// The state is entered legitimately every time a device appears — the library
+// sets `suspended = true` with the comment "need a bus reset before operating"
+// and waits for TinyUSB to drive that reset as part of enumerating. It is only
+// a trap when the enumeration never happens, which on this stack it sometimes
+// does not.
+//
+// So: drive the reset ourselves, through the library's own public pair. The
+// end half clears `suspended`, which makes `connection_check()` reachable
+// again, so the next poll sees the bus as it actually is. Split across turns
+// rather than held with a busy-wait, because core1 owes tuh_task() its
+// attention every few microseconds and a 20 ms stall is how this backend
+// learned about bounded loops in the first place.
+void CdcHostBackend::serviceStuckPort(uint32_t nowMs) {
+  if (resetInFlight_) {
+    if (nowMs - resetStartedAt_ < kPortResetMs) return;
+    bridge_pio_usb_port_reset_end();
+    resetInFlight_ = false;
+    stuckSince_ = 0;
+    return;
+  }
+
+  bridge_pio_usb_port_t port;
+  bridge_pio_usb_probe(&port);
+
+  // Mounted is the definition of not stuck, whatever the flags say.
+  const bool stuck = port.initialized && port.connected && port.suspended &&
+                     !present();
+  if (!stuck) {
+    stuckSince_ = 0;
+    return;
+  }
+
+  if (stuckSince_ == 0) {
+    stuckSince_ = nowMs;
+    return;
+  }
+  if (nowMs - stuckSince_ < kPortStuckMs) return;
+
+  ++portResets_;
+  resetStartedAt_ = nowMs;
+  resetInFlight_ = true;
+  bridge_pio_usb_port_reset_start();
+}
+
 void CdcHostBackend::serviceHost() {
   ++hostTasks_;
   beat_.store(hostTasks_, std::memory_order_release);
+  serviceStuckPort(millis());
   setHostPhase(kPhaseOp);
   executeOp();
   if (open_.load(std::memory_order_acquire)) {

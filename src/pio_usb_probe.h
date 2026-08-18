@@ -32,6 +32,19 @@ typedef struct {
 
 void bridge_pio_usb_probe(bridge_pio_usb_port_t* out);
 
+// Drive a bus reset on the root port, in two halves so the caller can hold the
+// line low for the required time without blocking. Both are the library's own
+// public entry points — the same pair TinyUSB's HCD calls to enumerate — so
+// this changes no state the library does not change itself.
+//
+// The reason to want them: `suspended` is cleared *only* by the end half, and
+// while it is set the library never evaluates `connection_check()`, which is
+// the only thing that can notice a device being unplugged. A port left
+// suspended therefore cannot see a disconnect or, afterwards, a fresh connect.
+// See OPEN-ISSUES.md 4.
+void bridge_pio_usb_port_reset_start(void);
+void bridge_pio_usb_port_reset_end(void);
+
 #ifdef __cplusplus
 }
 #endif

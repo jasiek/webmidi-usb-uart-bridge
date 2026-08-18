@@ -141,6 +141,15 @@ class CdcHostBackend : public Backend {
   uint32_t hostTxSpace() const { return hostTxSpace_; }
   uint32_t hostRxAvail() const { return hostRxAvail_; }
   uint32_t paceStalls() const { return paceDropped_; }
+  uint32_t portResets() const { return portResets_; }
+
+  // How long a connected-but-suspended port is tolerated before it is reset.
+  // Enumeration of a healthy device takes a few tens of milliseconds, so a
+  // whole second of it is already abnormal; the margin is for a slow device
+  // rather than for a hung one.
+  static constexpr uint32_t kPortStuckMs = 1500;
+  // USB requires a reset to be held for at least 10 ms. 20 is unhurried.
+  static constexpr uint32_t kPortResetMs = 20;
 
   // The adapter's transmit FIFO is the thing being protected, so the burst
   // allowed after an idle period is sized to fit inside one. 64 is the FT232R's
@@ -263,6 +272,10 @@ class CdcHostBackend : public Backend {
   // one transition and a count from another.
   void setPresent(bool present);
 
+  // core1: notice a root port that has gone deaf, and knock it back into a
+  // state where the library can see the bus again.
+  void serviceStuckPort(uint32_t nowMs);
+
   // --- shared state, written by exactly one core each ---
 
   // Bit 0 attached, bits 1.. transitions. Boots at 0: nothing attached, and
@@ -313,6 +326,12 @@ class CdcHostBackend : public Backend {
   uint32_t hostTxSpace_ = 0;
   uint32_t hostRxAvail_ = 0;
   uint32_t paceDropped_ = 0;   // pumps that had bytes but no budget
+  uint32_t portResets_ = 0;    // times serviceStuckPort() intervened
+
+  // Stuck-port detection, core1 only.
+  uint32_t stuckSince_ = 0;    // 0 = not currently stuck
+  uint32_t resetStartedAt_ = 0;
+  bool resetInFlight_ = false;
 
   // Token bucket for the outbound pump, in bytes. core1 only.
   uint32_t paceTokens_ = 0;

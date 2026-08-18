@@ -16,4 +16,8 @@ void bridge_pio_usb_probe(bridge_pio_usb_port_t* out) {
   out->ep_stalled = rp->ep_stalled;
 }
 
+void bridge_pio_usb_port_reset_start(void) { pio_usb_host_port_reset_start(0); }
+
+void bridge_pio_usb_port_reset_end(void) { pio_usb_host_port_reset_end(0); }
+
 #endif  // BRIDGE_BACKEND_CDC_HOST
