@@ -44,7 +44,14 @@ port**, because building one needs the parts below. See DECISIONS.md D1 for the
 phasing and D8 for how the firmware is structured around it.
 
 The pin pair is a build setting, not a hard-coded constant: `-DBRIDGE_PIO_USB_DP=16`
-picks D+, and D− is always the next GPIO up.
+names the GPIO the socket's D+ reaches, and D− is the next GPIO up.
+
+If a board comes out with the two crossed, `-DBRIDGE_PIO_USB_SWAP` puts D− on
+the GPIO *below* D+ instead — the library supports either order
+(`PIO_USB_PINOUT_DMDP`), so it is a rebuild rather than a rework. It is not the
+default and should not become one: the table below is the wiring this project
+documents, and a firmware that silently accommodates a crossed pair is a
+firmware that hides one. Use it to confirm a diagnosis, then fix the wire.
 
 Pico-PIO-USB bit-bangs a USB host port using PIO. Its constraints are specific
 and unforgiving:

@@ -179,6 +179,17 @@ next person does not rediscover them.
   `enum=` beside it counts *every* device that enumerates whatever its class,
   from `tuh_mount_cb`, so `attached=0 enum=1` is a device that is not a serial
   adapter while `attached=0 enum=0` never got that far.
+- **`enum=` and `bus=` still cannot tell "never detected" from "detected and
+  enumeration failed".** Both read `enum=0`, and that is the difference between
+  a wiring fault and a signal-integrity one. The root port itself knows:
+  `pio_usb_root_port[0].connected` is set from the line-state poll before any
+  transfer is attempted, and `ep_error` counts transfers that came back broken.
+  The debug build's `port:` row reports them.
+- `pio_usb_ll.h` **does not compile as C++** — it assigns an `int` to a
+  `port_pin_status_t` and redeclares an `inline` the Pico SDK already has, so
+  including it from a `.cpp` fails on both. `src/pio_usb_probe.c` is a C file
+  for that reason alone; re-declaring `root_port_t` in C++ instead would
+  compile and would silently break the day the library reorders a field.
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs

@@ -37,13 +37,27 @@
 
 namespace bridge {
 
-// Pico-PIO-USB needs D+ and D− on consecutive GPIOs with D+ the lower of the
-// two. GPIO0/1 belong to the phase 1 UART, so the port starts at GPIO16.
+// Pico-PIO-USB needs D+ and D− on consecutive GPIOs. GPIO0/1 belong to the
+// phase 1 UART, so the port starts at GPIO16. This names the GPIO the socket's
+// D+ actually reaches, which is the thing a meter can check.
 #ifndef BRIDGE_PIO_USB_DP
 #define BRIDGE_PIO_USB_DP 16
 #endif
 constexpr int kPinUsbDp = BRIDGE_PIO_USB_DP;
+
+// The pair has to be adjacent; it does not have to be in that order. The
+// library takes either way round: PIO_USB_PINOUT_DPDM puts D− above D+ and
+// DMDP puts it below, so a socket that came out crossed is a build flag
+// rather than a rework. hardware/README.md documents D+ low and that stays the
+// default, because a firmware that quietly accommodates a miswired board is a
+// firmware that hides one.
+#ifdef BRIDGE_PIO_USB_SWAP
+constexpr int kPinUsbDm = BRIDGE_PIO_USB_DP - 1;
+constexpr bool kPinUsbSwapped = true;
+#else
 constexpr int kPinUsbDm = BRIDGE_PIO_USB_DP + 1;
+constexpr bool kPinUsbSwapped = false;
+#endif
 
 // Pico-PIO-USB will not enumerate unless the system clock is a multiple of
 // 12 MHz. 120 MHz is the usual choice and what platformio.ini sets; the

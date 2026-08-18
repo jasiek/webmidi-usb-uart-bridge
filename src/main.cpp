@@ -25,6 +25,7 @@
 #include <atomic>
 
 #include "cdc_host_backend.h"
+#include "pio_usb_probe.h"
 #else
 #include "uart_backend.h"
 #endif
@@ -192,6 +193,25 @@ void serviceDebug(uint32_t nowMs) {
         static_cast<unsigned long>(bridge::gCdcHost.opTimeouts()),
         bridge::gCdcHost.outputLines(),
         bridge::gCdcHost.dpLevel() ? 1 : 0, bridge::gCdcHost.dmLevel() ? 1 : 0);
+
+    // One level below TinyUSB: the PIO-USB root port's own view. `conn` is set
+    // by the line-state poll as soon as a pull-up appears, before any transfer
+    // is attempted, so conn=1 enum=0 means the port saw the device and
+    // enumeration failed, while conn=0 with a pull-up on the bus means the
+    // detection itself is not happening. ep_err counts transfers that came
+    // back broken, which is what bad signal integrity looks like from here.
+    if (SerialTinyUSB.availableForWrite() >= 64) {
+      bridge_pio_usb_port_t rp;
+      bridge_pio_usb_probe(&rp);
+      SerialTinyUSB.printf(
+          "    port: init=%d conn=%d fullspeed=%d susp=%d ep_err=0x%lx"
+          " ep_stall=0x%lx pins=%u/%u\r\n",
+          rp.initialized ? 1 : 0, rp.connected ? 1 : 0,
+          rp.is_fullspeed ? 1 : 0, rp.suspended ? 1 : 0,
+          static_cast<unsigned long>(rp.ep_error),
+          static_cast<unsigned long>(rp.ep_stalled),
+          static_cast<unsigned>(rp.pin_dp), static_cast<unsigned>(rp.pin_dm));
+    }
   }
 #endif
 
@@ -368,7 +388,12 @@ void setup1() {
   while (!deviceReady.load(std::memory_order_acquire)) tight_loop_contents();
 
   pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-  pio_cfg.pin_dp = bridge::kPinUsbDp;  // D− is implicitly the next GPIO up
+  pio_cfg.pin_dp = bridge::kPinUsbDp;
+  // Which side of D+ the D− pin sits on. The default config says "the next
+  // GPIO up"; -DBRIDGE_PIO_USB_SWAP says the one below, for a socket wired the
+  // other way round. See cdc_host_backend.h.
+  pio_cfg.pinout = bridge::kPinUsbSwapped ? PIO_USB_PINOUT_DMDP
+                                          : PIO_USB_PINOUT_DPDM;
   USBHost.configure_pio_usb(1, &pio_cfg);
   USBHost.begin(1);
 
