@@ -338,6 +338,18 @@ next person does not rediscover them.
   of time rather than losing data — except that a 180 s timeout at 9600 still
   stops at ~3494, so it is a genuine stall and not slowness. Still undiagnosed.
 
+- **Neither library supports being torn down, so the host port is a one-shot.**
+  `tuh_deinit()` is present in TinyUSB 3.7.7 and does nothing here: it asserts
+  on `hcd_deinit()`, the PIO-USB controller defines none, and the weak stub
+  (`usbh.c:53`) returns false. Pico-PIO-USB's `pio_usb_host_stop()` cancels its
+  alarm-pool timer and unclaims nothing — and it spins on a flag cleared by a
+  callback serviced on core1, so calling it from core0 to recover a wedged
+  core1 can take core0 with it. `pio_usb_bus_init()` claims three PIO state
+  machines and a DMA channel and never unclaims them, so a second
+  `USBHost.begin(1)` panics inside the SDK's `hw_claim_or_assert`. Anything
+  built on "restart the host stack" has to solve all four first; OPEN-ISSUES 2
+  has the detail.
+
 - Pico-PIO-USB needs a system clock that is a multiple of 12 MHz and the Pico's
   default 125 MHz is not one. Setting it from `setup()` is too late — the core
   has already configured peripherals against the old divisors — so it belongs

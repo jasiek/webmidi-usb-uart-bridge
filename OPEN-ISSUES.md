@@ -80,6 +80,43 @@ Worth separating from issue 1 because it is *ours* and would be worth doing
 even if TinyUSB grew a timeout tomorrow: any backend on a separate core needs a
 recovery story, not just a detection story.
 
+**Restarting core1 was investigated on 2026-08-18 and does not work.** The
+option this issue used to prefer — `restartCore1()` and re-run
+`USBHost.begin(1)` — is not merely risky, it is blocked at four separate
+points, none of which is ours to move:
+
+1. `tuh_deinit()` exists in TinyUSB 3.7.7 but is a no-op for this port. It
+   does `TU_ASSERT(hcd_deinit(rhport))`, and the PIO-USB host controller
+   defines no `hcd_deinit` — so the weak stub in `usbh.c:53` returns `false`
+   and `tuh_deinit()` bails out having torn nothing down.
+2. `pio_usb_host_stop()` only cancels the library's alarm-pool timer. It
+   unclaims nothing.
+3. Worse, it spins: `while (cancel_timer_flag) continue;`, and the flag is
+   cleared by a callback serviced on core1. Calling it from core0 to recover a
+   wedged core1 risks taking core0 down as well, which is the one thing the
+   two-core split exists to prevent.
+4. `pio_usb_bus_init()` claims three PIO state machines (`pio_usb.c:377-379`)
+   and a DMA channel (`dma_claim_mask`, `pio_usb.c:394`), and nothing in the
+   library ever unclaims them. A second `USBHost.begin(1)` therefore reaches
+   `pio_sm_claim` on an already-claimed SM, and the SDK's `hw_claim_or_assert`
+   **panics**.
+
+The claims are reachable — `pio_usb_ll.h:110` exports `pio_port[1]`, so the SM
+and DMA numbers could be unclaimed by hand — but that is reaching past two
+libraries' interfaces into their internal state to undo initialisation neither
+of them supports undoing, and it still leaves TinyUSB's device tree, endpoint
+state and alarm pool dangling. Not a foundation for a recovery path.
+
+**Which leaves the full software reset**, and that is now a decision rather
+than a fallback, because `src/main.cpp:393` currently rules it out on purpose:
+"a core1 wedged inside a control transfer to a misbehaving adapter should leave
+the MIDI tunnel up to say so, not reboot the board out from under the host that
+is asking." Rebooting automatically reverses that. The alternative is to make
+the reboot host-commanded — the host can already see `ERR_BACKEND` and a
+`Fault` port, so it has what it needs to decide — which means a new protocol
+command, since overloading `RESET` would make a defined session-reset sometimes
+mean something else.
+
 ---
 
 ## 3. The loopback loses bytes, and it is not slowness
