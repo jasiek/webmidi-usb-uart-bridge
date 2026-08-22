@@ -339,9 +339,9 @@ void setup() {
   // does not surface. Leaving it as the core's "Pico" makes every board on the
   // bench look identical.
   TinyUSBDevice.setManufacturerDescriptor("webmidi-usb-uart-bridge");
-  TinyUSBDevice.setProductDescriptor("UART Bridge");
+  TinyUSBDevice.setProductDescriptor("MIDI-USB-UART Bridge");
 
-  usbMidi.setStringDescriptor("UART Bridge");
+  usbMidi.setStringDescriptor("MIDI-USB-UART Bridge");
   usbMidi.begin();
 
   if (TinyUSBDevice.mounted()) {

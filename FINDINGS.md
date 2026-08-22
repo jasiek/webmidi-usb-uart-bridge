@@ -543,6 +543,12 @@ plenty.
   what macOS surfaces as the port name; the device product descriptor is.
   Setting only the former, as the Adafruit examples do, leaves the port named
   after the board.
+- ioreg's `"USB Product Name"` property is a macOS-normalized copy, not the
+  descriptor: with the product string "MIDI-USB-UART Bridge" it reads
+  `MIDI_USB_UART Bridge`, hyphens turned to underscores — while the raw string
+  sits untouched in `kUSBProductString` on the same node (and in the registry
+  node name itself). Checking only the friendly property makes a correct
+  descriptor look wrong.
 - Measured round-trip latency for a `PING`/`PONG` over USB MIDI is **≈1 ms**
   (0.77 ms best of 10). SysEx through CoreMIDI is not the bottleneck anyone
   worries it will be.
