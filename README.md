@@ -128,6 +128,45 @@ model of the firmware with its TX looped to its RX. It is how the harness gets
 debugged before hardware is involved, and how the client's flow control is
 tested in CI.
 
+## Using it from a browser
+
+`host/dist/midi-bridge-serial.js` is a single self-contained ES module that
+exposes the bridge through the **Web Serial `SerialPort` shape** over the Web
+MIDI API — so an application written against `navigator.serial` (webchirp's
+`BrowserSerialBridge`, for instance) can talk to the bridge without knowing it
+is MIDI underneath. It is generated from `host/src/` by
+`npm run build:webserial`, and every `npm test` rebuilds and re-verifies it.
+
+```js
+import { createMidiBridgeSerial } from "./midi-bridge-serial.js";
+
+const provider = createMidiBridgeSerial();   // same contract as navigator.serial
+const port = await provider.requestPort();   // MIDI permission prompt + HELLO probe
+await port.open({ baudRate: 115200 });       // dataBits/stopBits/parity/flowControl too
+
+const writer = port.writable.getWriter();    // backpressured by the credit window
+const reader = port.readable.getReader();
+await port.setSignals({ dataTerminalReady: true });
+await port.close();
+```
+
+To consume from webchirp: copy the file into `web/js/` and hand the provider to
+`BrowserSerialBridge` (`bridge.serial = createMidiBridgeSerial();
+bridge.transport = "webmidi";` before `open()`), or call it directly as above.
+
+What to know before relying on it:
+
+- Web MIDI exists in Chromium (desktop and Android) and Firefox, needs a
+  secure context, and prompts once for SysEx access. **iOS Safari has no Web
+  MIDI** — on iOS the bridge is reachable from native apps via CoreMIDI, not
+  from a web page.
+- Web MIDI has no per-device chooser, so `requestPort()` *finds* the bridge:
+  name match first, then a HELLO probe that the device must answer. A port
+  name is never trusted on its own (CoreMIDI's name cache, FINDINGS.md).
+- Any lost byte — a device-reported error or a sequence gap — errors
+  `readable` rather than passing a silently-shortened stream. Reopen to
+  recover; DECISIONS.md D17 says why.
+
 ## Measured on hardware
 
 Flashed to a Pico 1, jumper on GPIO0↔GPIO1, driven from macOS over CoreMIDI.

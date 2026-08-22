@@ -496,3 +496,51 @@ boundaries; this buys a working phase 2 in the meantime and says so.
 **Evidence.** Five bauds, 4096 bytes each, all returning complete, twice in a
 row — against 3491 / 3566 / 4070 / 4073 / 4091 before. Confirmed independently
 first with a patched library and then with this implementation.
+## 2026-08-22 — Browser consumption (webchirp)
+
+### D17. Browser API: the Web Serial `SerialPort` shape, shipped as one generated file
+
+**Question.** The sibling webchirp project should be able to drive the bridge
+from a browser. What interface does it get, and in how many files?
+
+**Decision.** A Web Serial-shaped port over the Web MIDI API:
+`createMidiBridgeSerial()` returns a provider with the same `requestPort()`
+contract as `navigator.serial`, and the port implements the `SerialPort`
+subset webchirp's four WebUSB chip drivers already agree on (`open`,
+`readable`, `writable`, `setSignals`, `getSignals`, `getInfo`, `close`).
+Delivered as **one self-contained ES module**, `dist/midi-bridge-serial.js`,
+*generated* from `host/src/` by `bin/build-webserial.js` — concatenation in
+dependency order with internal imports stripped, verified by import and by the
+loopback tests on every `npm test`.
+
+**Why the Web Serial shape.** webchirp's `BrowserSerialBridge` treats any
+provider whose `requestPort()` yields that subset as interchangeable — its
+FTDI, PL2303, CH340 and CP2102 WebUSB drivers all present it. Matching the
+shape means the MIDI transport slots in with no change to webchirp's
+consumption model; inventing a bridge-specific API would push MIDI knowledge
+into every caller.
+
+**Why one generated file rather than hand-written or multi-file.** webchirp
+vendors self-contained single-file drivers into `web/js/`; a directory of six
+modules does not fit that convention. But hand-writing a self-contained file
+would create a *third* implementation of the protocol (firmware and host
+client are deliberately two, kept honest by tests — a third would be kept
+honest by nothing). Generating the file from the tested sources gives the
+single-file ergonomics without the drift.
+
+**Consequences worth recording.**
+
+- Web MIDI has no per-device chooser — permission covers the whole MIDI
+  system — so `requestPort()` *discovers* the bridge: name-ranked candidates,
+  then a HELLO probe each must answer. Names alone are never trusted, because
+  CoreMIDI caches them by VID/PID (FINDINGS.md).
+- Data loss is fatal to the stream: a device `ERROR` or a receive-side
+  sequence gap errors `readable` instead of resyncing quietly. For a port
+  that claims to be a serial cable — under a radio-cloning app, no less — a
+  stream that drops bytes and keeps going is worse than one that fails.
+- `writable` carries real backpressure (a write resolves when the device has
+  taken the bytes, paced by credit); `readable` does not push backpressure to
+  the device, because the client returns credit on arrival. Bounded in
+  practice by the ≤460800-baud far end.
+- iOS Safari has no Web MIDI, so this file serves desktop/Android browsers;
+  the iOS story remains native CoreMIDI apps.

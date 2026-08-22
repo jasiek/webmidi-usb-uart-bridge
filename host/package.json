@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --test",
+    "build:webserial": "node bin/build-webserial.js",
     "loopback": "node bin/loopback.js",
     "probe": "node bin/probe.js",
     "throughput": "node bin/throughput.js",
