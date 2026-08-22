@@ -33,6 +33,21 @@ next person does not rediscover them.
   zlib and libffi headers present *before* it starts. `bootstrap.sh` probes for
   them with the compiler and names the missing packages, because python-build's
   own failure is 200 lines of make output that does not.
+- asdf 0.16.1 (the Go rewrite, as shipped by Homebrew) exits 1 from
+  `asdf install` when every version is *already installed*, which kills
+  `bootstrap.sh` under `set -e` with no error printed — the last output is the
+  cheerful "already installed" list. `bootstrap.sh --no-asdf` sidesteps it when
+  the runtimes are already present; upgrading asdf fixes it properly.
+- The `.venv` path is contested. This repo uses it as the venv *directory*
+  (`bootstrap.sh`, `.gitignore`'s `.venv/`), but the zsh
+  `autoswitch_virtualenv` plugin uses `.venv` as a pointer *file* naming a venv
+  under `~/.virtualenvs`. The plugin's `mkvenv`, offered automatically because
+  `requirements.txt` exists, writes that file — and if venv creation then fails
+  (here: no `virtualenv` for the pinned python under asdf), the dangling
+  pointer yields "Unable to find `<name>` virtualenv" on every `cd`, and the
+  file blocks `bootstrap.sh` from creating the directory. The plugin tests
+  `[[ -f .venv ]]`, so once `.venv` is a real directory it is silently ignored:
+  run `./bootstrap.sh`, never `mkvenv`, in this repo.
 
 ## MIDI on a headless machine
 
